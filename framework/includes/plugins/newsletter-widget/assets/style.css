@@ -1,0 +1,92 @@
+/* ---------------------------------
+    Newsletter widget
+--------------------------------- */
+.bagels-news-letter-widget .nlw-form{
+    display: flex;
+    justify-content: flex-end;
+}
+
+.bagels-news-letter-widget .nlw-f-1 {
+    display: inline-flex;
+    align-items: center;
+}
+
+.bagels-news-letter-widget .nlw-f-1:focus,
+.bagels-news-letter-widget .nlw-f-1:focus-within,
+.bagels-news-letter-widget .nlw-f-1:focus-visible{
+    filter: drop-shadow(0px 5px 5px rgba(0, 0, 0, 0.1));
+}
+
+.bagels-news-letter-widget #nlw-f-i-email {
+    width: 250px;
+    padding: 10px;
+    border-top-left-radius: 5px;
+    border-bottom-left-radius: 5px;
+    border-right-width: 0;
+}
+
+.bagels-news-letter-widget #nlw-f-b-submit {
+    padding: 10px 0;
+    border-top-right-radius: 5px;
+    border-bottom-right-radius: 5px;
+    border-left-width: 0;
+    width: 55px;
+    -webkit-transition: all 0.2s ease-in-out;
+    -moz-transition: all 0.2s ease-in-out;
+    transition: all 0.2s ease-in-out;
+    position: relative;
+}
+
+.bagels-news-letter-widget .nlw-f-msg{
+    display: none;
+}
+
+.bagels-news-letter-widget .nlw-f-msg:not(:first-child) {
+    margin-top: 10px;
+}
+
+.bagels-news-letter-widget #nlw-f-b-submit.loading{
+    pointer-events: none;
+    opacity: 0.5;
+}
+
+.bagels-news-letter-widget #nlw-f-b-submit.loading .nlw-f-b-s-1{
+    opacity: 0;
+}
+
+.spinner{
+    display: none;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    -webkit-transform: translate(-50%, -50%);
+    -moz-transform: translate(-50%, -50%);
+    transform: translate(-50%, -50%);
+}
+
+.spinner:after {
+    content: '';
+    display: block;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    border: 2px solid #fff;
+    border-color: #fff transparent #fff transparent;
+    border-color: #3e3e3e transparent #3e3e3e transparent;
+    animation: pgl-dual-ring 1.2s linear infinite;
+}
+
+.loading .spinner{
+    display: block;
+}
+
+@media (max-width: 767px) {
+    .bagels-news-letter-widget .nlw-f-1,
+    .bagels-news-letter-widget #nlw-f-i-email{
+        width: 100%;
+    }
+
+    .bagels-news-letter-widget .nlw-f-input{
+        width: calc( 100% - 55px );
+    }
+}
