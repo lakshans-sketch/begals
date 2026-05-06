@@ -1,0 +1,359 @@
+/* ===== Hero Section ===== */
+.hero {
+    position: relative;
+    width: 100%;
+    height: 80vh; /* adjust height as needed */
+    display: flex;
+    align-items: center; /* vertical center of container */
+    background-color: #000;
+    overflow: hidden;
+    margin-bottom: 20px;
+}
+
+/* Video Styling */
+.hero-video {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 100%;
+    height: 100%;
+    object-fit: cover; /* cover hero without distortion */
+    transform: translate(-50%, -50%);
+    z-index: 1;
+}
+
+/* Overlay Styling */
+.hero-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.164); /* dark overlay for readability */
+    z-index: 2;
+}
+
+
+.page-container.pg-home {
+    position: relative; /* normal flow */
+    z-index: 3;
+    width: 100%;
+    max-width: 1200px; 
+    padding: 0 20px; 
+    display: flex;
+    flex-direction: column; /* stack heading, paragraph, button */
+    justify-content: center; /* vertical center */
+    height: 100%; /* fill hero height */
+    text-align: left; /* horizontal left alignment */
+}
+
+/* Hero Content */
+.hero-content h1 {
+    font-size: 64px;
+    color: #fff;
+    margin-bottom: 1rem;
+}
+
+.hero-content h4 {
+    font-size: 34px;
+    color: #fff;
+    line-height: 1.5;
+    max-width: 800px;
+    margin-bottom: 1rem;
+}
+
+.hero-content p {
+    font-size: 24px;
+    color: #fff;
+    max-width: 800px;
+    margin-bottom: 2rem;
+}
+
+/* Hero Button */
+.hero-btn {
+    display: inline-block;
+    padding: 0.75rem 2rem;
+    font-weight: 600;
+    text-decoration: none;
+    border-radius: 8px;
+    transition: background 0.3s ease;
+}
+
+.hero-btn:hover {
+    
+}
+
+
+.offer {
+    position: relative;
+    padding: 40px 20px;
+}
+
+.offer-heading {
+    text-align: center;
+    font-size: 54px;
+    margin-bottom: 30px;
+    color: #333;
+}
+
+/* Wrapper for all products */
+.offer-products-wrapper {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    justify-content: center;
+}
+
+
+.offer-product-card {
+    background-color: #fff;
+    border: 1px solid #eee;
+    border-radius: 12px;
+    overflow: hidden;
+    width: 300px;
+    height: 350px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    transition: all 0.3s ease;
+
+}
+
+.offer-product-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+}
+
+.product-image img {
+    width: 100%;
+    height: 200px;
+    object-fit: cover;
+    border-radius: 10px;
+    display: block;
+}
+
+.product-info {
+    padding: 15px;
+    text-align: center;
+}
+
+
+
+.product-title a {
+    text-decoration: none;
+    color: inherit;
+}
+
+.product-title a:hover {
+    color: #ff6600;
+}
+
+
+.product-prices {
+    margin: 12px 0;
+    font-size: 15px;
+}
+
+.regular-price {
+    text-decoration: line-through;
+    color: #999;
+    margin-right: 8px;
+    font-size: 13px;
+}
+
+.sale-price {
+    color: #007c59;
+    font-weight: 600;
+}
+
+.stock-status {
+    font-size: 0.9rem;
+    margin: 8px 0;
+    color: #555;
+    font-weight: 500;
+}
+
+.product-rating {
+    margin-top: 10px;
+    font-size: 0.9rem;
+    color: #f39c12;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+}
+
+
+.no-products-message {
+    text-align: center;
+    font-size: 1rem;
+    color: #666;
+    margin-top: 20px;
+}
+/* Owl nav arrows */
+.owl-nav button {
+    background: #ff6600;
+    color: #fff;
+    border-radius: 50%;
+    padding: 5px 10px;
+    position: absolute;
+    top: 35%;
+}
+
+.owl-nav button:hover {
+    background: #e65500;
+}
+
+.owl-nav .owl-prev {
+    left: -25px;
+}
+
+.owl-nav .owl-next {
+    right: -25px;
+}
+
+.owl-dots {
+    display: none; /* hide dots if not needed */
+}
+
+/* ===== Room Template Product Grid ===== */
+
+.room-products {
+  padding: 60px 0;
+}
+
+.room-products .section-header {
+  text-align: center;
+  margin-bottom: 40px;
+}
+
+.room-products .section-header h2 {
+  font-size: 2rem;
+  font-weight: 600;
+  color: #222;
+  text-transform: capitalize;
+}
+
+/* --- Product grid layout --- */
+.room-products .products-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 25px;
+}
+
+/* --- Each product card --- */
+.room-products .product-item {
+  background: #fff;
+  border: 1px solid #eee;
+  border-radius: 12px;
+  text-align: center;
+  transition: all 0.3s ease;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+  width: 280px;
+}
+
+.room-products .product-item:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+}
+
+/* --- Product image --- */
+.room-products .product-thumb img {
+  width: 100%;
+  height: 200px;
+  object-fit: cover;
+  border-radius: 10px;
+  margin-bottom: 15px;
+}
+
+/* --- Product title --- */
+.room-products .product-title {
+  font-size: 20px;
+  color: #333;
+  font-weight: 500;
+  margin: 10px 0 5px;
+  transition: color 0.3s ease;
+}
+
+.room-products .product-item:hover .product-title {
+  color: #0073aa; /* WordPress blue accent */
+}
+
+/* --- Product price --- */
+.room-products .product-price {
+  display: block;
+  font-size: 15px;
+  font-weight: 600;
+  color: #007c59;
+}
+
+.single-product .ppc-button-wrapper {
+    display: none !important;
+}
+
+/* --- Responsive adjustments --- */
+@media (max-width: 768px) {
+  .room-products .products-grid {
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  }
+
+  .room-products .section-header h2 {
+    font-size: 1.5rem;
+  }
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .offer-products-wrapper {
+        flex-direction: column;
+        align-items: center;
+    }
+
+    .offer-product-card {
+        width: 90%;
+    }
+}
+
+
+/* Responsive */
+@media (max-width: 992px) {
+    .hero {
+        height: 70vh;
+    }
+
+    .hero-content h1 {
+        font-size: 2.5rem;
+    }
+
+    .hero-content h4 {
+        font-size: 1.5rem;
+    }
+
+    .hero-content p {
+        font-size: 1rem;
+    }
+}
+
+@media (max-width: 768px) {
+    .hero {
+        height: 60vh;
+    }
+
+    .page-container.pg-home {
+        padding: 0 15px;
+    }
+
+    .hero-content h1 {
+        font-size: 2rem;
+    }
+
+    .hero-content h4 {
+        font-size: 1.2rem;
+    }
+
+    .hero-content p {
+        font-size: 0.95rem;
+    }
+
+    .hero-btn {
+        padding: 0.5rem 1.5rem;
+    }
+}

@@ -1,0 +1,24 @@
+/* ---------------------------------
+    Social widget
+--------------------------------- */
+.bagels-social-icons-widget{
+    position: relative;
+}
+.bagels-social-icons-widget .siw-list{
+    padding: 0;
+    margin: 0 0 -15px 0;
+    list-style-type: none;
+}
+.bagels-social-icons-widget .siw-list li{
+    display: inline-block;
+    margin-bottom: 15px;
+}
+
+.bagels-social-icons-widget .siw-list li:not(:last-child){
+    margin-right: 20px;
+}
+
+.bagels-social-icons-widget .siw-list li a{
+    display: inline-block;
+    font-size: 20px;
+}
