@@ -9,6 +9,7 @@ include_once( ABSPATH . 'wp-admin/includes/plugin.php' );
 
 define('THEME_DIRECTORY_URI', get_template_directory_uri());
 define('THEME_DIRECTORY', get_template_directory());
+define('BAGELS_GEOLITE2_DIRECTORY', THEME_DIRECTORY . '/framework/libs/GeoLite2'); //GeoLite database
 define('STYLE_SHEET_URI', get_stylesheet_uri());
 define('VERSION_NUMBER', 2.3);
 
@@ -38,18 +39,22 @@ function bagels_setup() {
      * @link https://developer.wordpress.org/themes/functionality/featured-images-post-thumbnails/
      */
     add_theme_support( 'post-thumbnails' );
-
+    require_once get_template_directory() . '/framework/includes/class-wp-security-implementation.php';
     // Bootstrap Nav Walker
     require_once( THEME_DIRECTORY. '/framework/includes/class-wp-bootstrap-navwalker.php' );
 	// Custom Login URL Handler (Place this AFTER Bootstrap Nav Walker)
-	if ( file_exists( get_template_directory() . '/framework/includes/custom-login-url.php' ) ) {
-	    require_once get_template_directory() . '/framework/includes/custom-login-url.php';
-	} else {
-	    // Log error if file is missing
-	    if ( defined('WP_DEBUG') && WP_DEBUG ) {
-	        error_log( 'Custom Login URL file not found: ' . get_template_directory() . '/framework/includes/custom-login-url.php' );
-	    }
-	}
+
+
+	// if ( file_exists( get_template_directory() . '/framework/includes/custom-login-url.php' ) ) {
+	//     require_once get_template_directory() . '/framework/includes/custom-login-url.php';
+	// } else {
+	//     // Log error if file is missing
+	//     if ( defined('WP_DEBUG') && WP_DEBUG ) {
+	//         error_log( 'Custom Login URL file not found: ' . get_template_directory() . '/framework/includes/custom-login-url.php' );
+	//     }
+	// }
+
+    
     if ( ! file_exists( THEME_DIRECTORY. '/framework/includes/class-wp-bootstrap-navwalker.php' ) ) {
         // File does not exist... return an error.
         return new WP_Error( 'class-wp-bootstrap-navwalker-missing', __( 'It appears the class-wp-bootstrap-navwalker.php file may be missing.', 'wp-bootstrap-navwalker' ) );
@@ -162,5 +167,4 @@ function bagels_body_classes( $classes ) {
 
     return $classes;
 }
-
 
