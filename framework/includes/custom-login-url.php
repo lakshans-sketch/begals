@@ -67,16 +67,28 @@ class Custom_Login_URL {
             $this->process_login();
         }
         
+        // Handle OTP form submission
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['otp_submit'])) {
+            $this->process_otp();
+        }
+        
         // Get any error messages
         $error_message = '';
         $has_error = false;
         if (isset($_GET['login']) && $_GET['login'] === 'failed') {
             $error_message = '<strong>Error:</strong> Invalid username or password.';
             $has_error = true;
+        } elseif (isset($_GET['login']) && $_GET['login'] === 'otp_failed') {
+            $error_message = '<strong>Error:</strong> Invalid or expired verification code.';
+            $has_error = true;
         }
         
-        // Render the login form
-        $this->render_login_form($error_message, $has_error);
+        // Render the appropriate form
+        if (isset($_GET['login']) && ($_GET['login'] === 'otp' || $_GET['login'] === 'otp_failed')) {
+            $this->render_otp_form($error_message, $has_error);
+        } else {
+            $this->render_login_form($error_message, $has_error);
+        }
     }
     
     /**
@@ -93,19 +105,95 @@ class Custom_Login_URL {
         $password = $_POST['pwd'];
         $remember = isset($_POST['rememberme']);
         
-        $creds = array(
-            'user_login'    => $username,
-            'user_password' => $password,
-            'remember'      => $remember
-        );
-        
-        $user = wp_signon($creds, is_ssl());
+        // Authenticate the user without logging them in immediately
+        $user = wp_authenticate($username, $password);
         
         if (is_wp_error($user)) {
             wp_safe_redirect(home_url($this->custom_login_slug . '?login=failed'));
             exit;
         } else {
+            // Step 2 — OTP is generated & emailed
+            $otp = wp_rand(100000, 999999);
+            
+            // Save OTP temporarily on the server (tied to that user) for 10 minutes
+            set_transient('bagels_otp_' . $user->ID, $otp, 10 * MINUTE_IN_SECONDS);
+            
+            // Email the user
+            $to = $user->user_email;
+            $subject = 'Your Login OTP';
+            $message = "Your One-Time Password is: {$otp}\n\nThis code will expire in 10 minutes.";
+            wp_mail($to, $subject, $message);
+            
+            // Set a temporary cookie to track the user session through the OTP phase
+            $token_data = array(
+                'user_id'  => $user->ID,
+                'remember' => $remember,
+                'time'     => time()
+            );
+            $token_data['hash'] = hash_hmac('sha256', $user->ID . $remember . $token_data['time'], wp_salt());
+            
+            setcookie('bagels_otp_token', base64_encode(json_encode($token_data)), time() + 10 * MINUTE_IN_SECONDS, '/', '', is_ssl(), true);
+            
+            wp_safe_redirect(home_url($this->custom_login_slug . '?login=otp'));
+            exit;
+        }
+    }
+    
+    /**
+     * Process OTP submission
+     */
+    private function process_otp() {
+        // Verify nonce
+        if (!isset($_POST['otp_nonce']) || !wp_verify_nonce($_POST['otp_nonce'], 'otp_action')) {
+            wp_die('Security check failed');
+        }
+        
+        $token = isset($_COOKIE['bagels_otp_token']) ? $_COOKIE['bagels_otp_token'] : '';
+        if (!$token) {
+            wp_safe_redirect(home_url($this->custom_login_slug . '?login=failed'));
+            exit;
+        }
+        
+        $decoded = json_decode(base64_decode($token), true);
+        if (!$decoded || !isset($decoded['user_id']) || !isset($decoded['hash'])) {
+            wp_safe_redirect(home_url($this->custom_login_slug . '?login=failed'));
+            exit;
+        }
+        
+        $expected_hash = hash_hmac('sha256', $decoded['user_id'] . $decoded['remember'] . $decoded['time'], wp_salt());
+        if (!hash_equals($expected_hash, $decoded['hash'])) {
+            wp_safe_redirect(home_url($this->custom_login_slug . '?login=failed'));
+            exit;
+        }
+        
+        if (time() - $decoded['time'] > 10 * MINUTE_IN_SECONDS) {
+            wp_safe_redirect(home_url($this->custom_login_slug . '?login=otp_failed'));
+            exit;
+        }
+        
+        $user_id = $decoded['user_id'];
+        $remember = $decoded['remember'];
+        
+        $entered_otp = sanitize_text_field($_POST['otp_code']);
+        $stored_otp = get_transient('bagels_otp_' . $user_id);
+        
+        // Step 4 — User submits the code
+        if ($stored_otp && $entered_otp == $stored_otp) {
+            // Step 5 — Cleanup
+            delete_transient('bagels_otp_' . $user_id);
+            setcookie('bagels_otp_token', '', time() - 3600, '/', '', is_ssl(), true);
+            
+            // Log the user in
+            wp_set_current_user($user_id);
+            wp_set_auth_cookie($user_id, $remember, is_ssl());
+            
+            $user = get_userdata($user_id);
+            do_action('wp_login', $user->user_login, $user);
+            
             wp_safe_redirect(admin_url());
+            exit;
+        } else {
+            wp_safe_redirect(home_url($this->custom_login_slug . '?login=otp_failed'));
             exit;
         }
     }
@@ -229,6 +317,78 @@ class Custom_Login_URL {
                     });
                 }
             })();
+            </script>
+        </body>
+        </html>
+        <?php
+    }
+    
+    /**
+     * Render OTP form
+     */
+    private function render_otp_form($error_message = '', $has_error = false) {
+        wp_enqueue_style('login');
+        
+        nocache_headers();
+        
+        ?>
+        <!DOCTYPE html>
+        <html <?php language_attributes(); ?>>
+        <head>
+            <meta http-equiv="Content-Type" content="<?php bloginfo('html_type'); ?>; charset=<?php bloginfo('charset'); ?>" />
+            <title><?php echo get_bloginfo('name'); ?> &rsaquo; Enter OTP</title>
+            <?php
+            wp_admin_css('login', true);
+            
+            if ( wp_is_mobile() ) {
+                ?>
+                <meta name="viewport" content="width=device-width" />
+                <?php
+            }
+            
+            do_action('login_enqueue_scripts');
+            do_action('login_head');
+            ?>
+        </head>
+        <body class="login no-js login-action-login wp-core-ui">
+            <script type="text/javascript">
+                document.body.className = document.body.className.replace('no-js','js');
+            </script>
+            
+            <div id="login">
+                <h1><a href="<?php echo esc_url(home_url('/')); ?>"><?php bloginfo('name'); ?></a></h1>
+                
+                <?php if ($has_error && $error_message): ?>
+                <div id="login_error"><?php echo $error_message; ?></div>
+                <?php else: ?>
+                <div class="message" style="border-left: 4px solid #72aee6; padding: 12px; margin-bottom: 20px; background-color: #fff; box-shadow: 0 1px 1px 0 rgba(0,0,0,.1);">
+                    <p>Please check your email for the 6-digit One-Time Password.</p>
+                </div>
+                <?php endif; ?>
+                
+                <form name="otpform" id="otpform" action="" method="post">
+                    <?php wp_nonce_field('otp_action', 'otp_nonce'); ?>
+                    
+                    <p>
+                        <label for="otp_code">Verification Code</label>
+                        <input type="text" name="otp_code" id="otp_code" class="input" value="" size="20" autocomplete="off" required />
+                    </p>
+                    
+                    <p class="submit">
+                        <input type="submit" name="otp_submit" id="wp-submit" class="button button-primary button-large" value="Verify Code" />
+                    </p>
+                </form>
+                
+                <p id="backtoblog">
+                    <a href="<?php echo esc_url(home_url('/')); ?>">&larr; Go to <?php bloginfo('name'); ?></a>
+                </p>
+            </div>
+            
+            <?php do_action('login_footer'); ?>
+            <script type="text/javascript">
+                setTimeout( function() {
+                    try { document.getElementById('otp_code').focus(); } catch(e) {}
+                }, 200);
             </script>
         </body>
         </html>
