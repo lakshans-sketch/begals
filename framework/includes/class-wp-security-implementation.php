@@ -20,10 +20,12 @@ if (!class_exists('WP_Security_Hardening')) {
         private $geoip_reader = null;
 
         private $allowed_countries = array(
-            "LK",
+            "IND",
         );
 
-        private $whitelisted_ips = array();
+        private $whitelisted_ips = array(
+            // "112.134.175.92"
+        );
         private $login_guard_table = '';
 
         public function __construct()
@@ -41,6 +43,7 @@ if (!class_exists('WP_Security_Hardening')) {
 
             $this->allowed_countries = apply_filters('bagels_allowed_countries', $this->allowed_countries);
             $this->whitelisted_ips = apply_filters('bagels_whitelisted_ips', $this->whitelisted_ips);
+            $this->whitelisted_ips = $this->sanitize_ip_list($this->whitelisted_ips);
 
             add_action('init', array($this, 'handle_security_checks'));
             add_filter('authenticate', array($this, 'block_bruteforce_authentication'), 1, 3);
@@ -52,6 +55,11 @@ if (!class_exists('WP_Security_Hardening')) {
             add_action('login_form_bagels_otp_verify', array($this, 'process_otp'));
             add_filter('login_message', array($this, 'render_login_attempt_notice'));
             add_action('login_head', array($this, 'hide_login_form_during_lockout'));
+            add_filter('lostpassword_url', array($this, 'filter_lostpassword_url'), 10, 2);
+            add_filter('retrieve_password_notification_email', array($this, 'filter_retrieve_password_notification_email'), 10, 4);
+            add_filter('retrieve_password_message', array($this, 'filter_retrieve_password_message'), 10, 4);
+            add_filter('wp_new_user_notification_email', array($this, 'filter_new_user_notification_email'), 10, 3);
+            add_action('wp_set_password', array($this, 'invalidate_sessions_after_password_change'), 10, 3);
         }
 
         private function ensure_login_guard_table_exists()
@@ -314,7 +322,48 @@ if (!class_exists('WP_Security_Hardening')) {
 
         private function is_whitelisted_ip($ip)
         {
-            return in_array($ip, $this->whitelisted_ips, true);
+            $normalized_ip = $this->normalize_ip(trim((string) $ip));
+            if (!filter_var($normalized_ip, FILTER_VALIDATE_IP)) {
+                return false;
+            }
+
+            return in_array($normalized_ip, $this->whitelisted_ips, true);
+        }
+
+        private function is_current_ip_whitelisted()
+        {
+            return $this->is_whitelisted_ip($this->get_user_ip());
+        }
+
+        private function sanitize_ip_list($ip_list)
+        {
+            if (!is_array($ip_list)) {
+                $ip_list = array($ip_list);
+            }
+
+            $sanitized = array();
+
+            foreach ($ip_list as $raw_entry) {
+                if (!is_scalar($raw_entry)) {
+                    continue;
+                }
+
+                $parts = preg_split('/[\s,]+/', (string) $raw_entry);
+                if (!is_array($parts)) {
+                    continue;
+                }
+
+                foreach ($parts as $part) {
+                    $candidate = $this->normalize_ip(trim($part));
+                    if ($candidate === '' || !filter_var($candidate, FILTER_VALIDATE_IP)) {
+                        continue;
+                    }
+
+                    $sanitized[] = $candidate;
+                }
+            }
+
+            return array_values(array_unique($sanitized));
         }
 
         private function is_allowed_country($country)
@@ -345,13 +394,165 @@ if (!class_exists('WP_Security_Hardening')) {
 
         private function redirect_to_login()
         {
-            $token = $_COOKIE['do_access_token'] ?? '';
-            $login_url = !empty($token)
-                ? add_query_arg('do_access', $token, wp_login_url())
-                : wp_login_url();
+            $login_args = $this->get_forwarded_login_query_args();
+            $login_url = add_query_arg($login_args, wp_login_url());
 
             wp_safe_redirect($login_url);
             exit;
+        }
+
+        private function get_forwarded_login_query_args()
+        {
+            $allowed_args = array('action', 'key', 'login', 'redirect_to', 'checkemail', 'reauth', 'interim-login');
+            $login_args = array();
+
+            foreach ($allowed_args as $arg_name) {
+                if (!isset($_GET[$arg_name]) || !is_scalar($_GET[$arg_name])) {
+                    continue;
+                }
+
+                $raw_value = wp_unslash($_GET[$arg_name]);
+                $value = '';
+
+                if ($arg_name === 'redirect_to') {
+                    $value = esc_url_raw((string) $raw_value);
+                } elseif (in_array($arg_name, array('action', 'checkemail', 'reauth', 'interim-login'), true)) {
+                    $value = sanitize_key((string) $raw_value);
+                } else {
+                    $value = sanitize_text_field((string) $raw_value);
+                }
+
+                if ($value !== '') {
+                    $login_args[$arg_name] = $value;
+                }
+            }
+
+            return $login_args;
+        }
+
+        private function build_protected_login_url($args = array())
+        {
+            $base_url = home_url('/do-access/');
+            $safe_args = array();
+            $allowed_args = array('action', 'key', 'login', 'redirect_to', 'checkemail', 'reauth', 'interim-login');
+
+            if (!is_array($args)) {
+                return $base_url;
+            }
+
+            foreach ($args as $arg_name => $arg_value) {
+                if (!in_array($arg_name, $allowed_args, true) || !is_scalar($arg_value)) {
+                    continue;
+                }
+
+                if ($arg_name === 'redirect_to') {
+                    $value = esc_url_raw((string) $arg_value);
+                } elseif (in_array($arg_name, array('action', 'checkemail', 'reauth', 'interim-login'), true)) {
+                    $value = sanitize_key((string) $arg_value);
+                } else {
+                    $value = sanitize_text_field((string) $arg_value);
+                }
+
+                if ($value !== '') {
+                    $safe_args[$arg_name] = $value;
+                }
+            }
+
+            if (empty($safe_args)) {
+                return $base_url;
+            }
+
+            return add_query_arg($safe_args, $base_url);
+        }
+
+        private function rewrite_wp_login_urls_in_message($message)
+        {
+            if (!is_string($message) || $message === '') {
+                return $message;
+            }
+
+            return preg_replace_callback(
+                '#https?://[^\s<>"\']*wp-login\.php(?:\?[^\s<>"\']*)?#i',
+                array($this, 'replace_wp_login_url_in_message'),
+                $message
+            );
+        }
+
+        private function replace_wp_login_url_in_message($matches)
+        {
+            $original_url = isset($matches[0]) ? $matches[0] : '';
+            if ($original_url === '') {
+                return $original_url;
+            }
+
+            $query = (string) parse_url($original_url, PHP_URL_QUERY);
+            $query = html_entity_decode($query, ENT_QUOTES, 'UTF-8');
+            $query_args = array();
+            parse_str($query, $query_args);
+
+            return $this->build_protected_login_url($query_args);
+        }
+
+        public function filter_lostpassword_url($lostpassword_url, $redirect)
+        {
+            $args = array('action' => 'lostpassword');
+
+            if (!empty($redirect)) {
+                $args['redirect_to'] = $redirect;
+            }
+
+            return $this->build_protected_login_url($args);
+        }
+
+        public function filter_retrieve_password_notification_email($defaults, $key, $user_login, $user_data)
+        {
+            if (!is_array($defaults) || empty($defaults['message']) || !is_string($defaults['message'])) {
+                return $defaults;
+            }
+
+            $defaults['message'] = $this->rewrite_wp_login_urls_in_message($defaults['message']);
+
+            return $defaults;
+        }
+
+        public function filter_retrieve_password_message($message, $key, $user_login, $user_data)
+        {
+            return $this->rewrite_wp_login_urls_in_message((string) $message);
+        }
+
+        public function filter_new_user_notification_email($wp_new_user_notification_email, $user, $blogname)
+        {
+            if (!is_array($wp_new_user_notification_email) || empty($wp_new_user_notification_email['message'])) {
+                return $wp_new_user_notification_email;
+            }
+
+            $wp_new_user_notification_email['message'] = $this->rewrite_wp_login_urls_in_message(
+                $wp_new_user_notification_email['message']
+            );
+
+            return $wp_new_user_notification_email;
+        }
+
+        public function invalidate_sessions_after_password_change($password, $user_id, $old_user_data = null)
+        {
+            $user_id = (int) $user_id;
+            if ($user_id <= 0 || !class_exists('WP_Session_Tokens')) {
+                return;
+            }
+
+            $sessions = WP_Session_Tokens::get_instance($user_id);
+            if ($sessions) {
+                $sessions->destroy_all();
+            }
+
+            if (get_current_user_id() === $user_id) {
+                wp_destroy_current_session();
+                wp_clear_auth_cookie();
+
+                if (function_exists('WC') && WC() && WC()->session) {
+                    WC()->session->destroy_session();
+                }
+            }
         }
 
         private function generate_do_access_token()
@@ -407,6 +608,10 @@ if (!class_exists('WP_Security_Hardening')) {
                 return $user;
             }
 
+            if ($this->is_current_ip_whitelisted()) {
+                return $user;
+            }
+
             if ($this->has_too_many_failed_logins()) {
                 $state = $this->get_failed_login_state();
                 $message = esc_html__('Access denied.', 'bagels');
@@ -434,6 +639,11 @@ if (!class_exists('WP_Security_Hardening')) {
         public function record_failed_login($username = '', $error = null)
         {
             if (!$this->is_standard_login_request()) {
+                return;
+            }
+
+            if ($this->is_current_ip_whitelisted()) {
+                $this->clear_failed_login_state();
                 return;
             }
 
@@ -500,6 +710,10 @@ if (!class_exists('WP_Security_Hardening')) {
                 return $message;
             }
 
+            if ($this->is_current_ip_whitelisted()) {
+                return $message;
+            }
+
             $current_action = isset($_REQUEST['action']) ? sanitize_key(wp_unslash($_REQUEST['action'])) : '';
             if (in_array($current_action, array('bagels_otp', 'bagels_otp_verify'), true)) {
                 return $message;
@@ -552,6 +766,10 @@ if (!class_exists('WP_Security_Hardening')) {
                 return;
             }
 
+            if ($this->is_current_ip_whitelisted()) {
+                return;
+            }
+
             $current_action = isset($_REQUEST['action']) ? sanitize_key(wp_unslash($_REQUEST['action'])) : '';
             if (in_array($current_action, array('bagels_otp', 'bagels_otp_verify'), true)) {
                 return;
@@ -574,6 +792,10 @@ if (!class_exists('WP_Security_Hardening')) {
 
         private function has_too_many_failed_logins()
         {
+            if ($this->is_current_ip_whitelisted()) {
+                return false;
+            }
+
             if ($this->is_ip_permanently_blocked()) {
                 return true;
             }
@@ -754,15 +976,15 @@ if (!class_exists('WP_Security_Hardening')) {
         {
             status_header(404);
             nocache_headers();
-            // Load the theme's 404 template
-            $template = get_404_template();
-            if ($template) {
-                include $template;
-                exit;
-            }
+            // // Load the theme's 404 template
+            // $template = get_404_template();
+            // if ($template) {
+            //     include $template;
+            //     exit;
+            // }
             // Fallback if no 404 template found
             wp_die(
-                esc_html__('Page not found.', 'bagels'),
+                esc_html__('Page not found.Contact Your Administration', 'bagels'),
                 esc_html__('404', 'bagels'),
                 array('response' => 404, 'back_link' => false)
             );
@@ -780,6 +1002,7 @@ if (!class_exists('WP_Security_Hardening')) {
 
             $otp = wp_rand(100000, 999999);
             set_transient('bagels_otp_' . $user->ID, $otp, 10 * MINUTE_IN_SECONDS);
+            delete_transient($this->get_otp_attempts_key($user->ID));
 
             $to = $user->user_email;
             $subject = get_bloginfo('name') . ' - Login Verification Code';
@@ -827,8 +1050,59 @@ if (!class_exists('WP_Security_Hardening')) {
             exit;
         }
 
-        public function render_otp_form($error_msg = '')
+        private function get_otp_max_attempts()
         {
+            return max(1, (int) apply_filters('bagels_otp_max_attempts', 5));
+        }
+
+        private function get_otp_attempts_key($user_id)
+        {
+            return 'bagels_otp_attempts_' . (int) $user_id;
+        }
+
+        private function get_otp_context_from_cookie()
+        {
+            $token = isset($_COOKIE['bagels_otp_token']) ? $_COOKIE['bagels_otp_token'] : '';
+            if (empty($token)) {
+                return false;
+            }
+
+            $decoded = json_decode(base64_decode($token), true);
+            if (!$decoded || empty($decoded['user_id']) || empty($decoded['hash'])) {
+                return false;
+            }
+
+            $expected_hash = hash_hmac('sha256', $decoded['user_id'] . $decoded['remember'] . $decoded['time'], wp_salt());
+            if (!hash_equals($expected_hash, $decoded['hash'])) {
+                return false;
+            }
+
+            return $decoded;
+        }
+
+        private function get_otp_login_url()
+        {
+            $login_url = wp_login_url();
+            if (isset($_REQUEST['do_access'])) {
+                $login_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $login_url);
+            } elseif (isset($_COOKIE['do_access_token'])) {
+                $login_url = add_query_arg('do_access', rawurlencode(wp_unslash($_COOKIE['do_access_token'])), $login_url);
+            }
+
+            return $login_url;
+        }
+
+        public function render_otp_form($error_msg = '', $force_hide_form = false)
+        {
+            $hide_form = $force_hide_form;
+            $otp_context = $this->get_otp_context_from_cookie();
+            if (!$hide_form && $otp_context) {
+                $attempts_made = (int) get_transient($this->get_otp_attempts_key($otp_context['user_id']));
+                if ($attempts_made >= $this->get_otp_max_attempts()) {
+                    $hide_form = true;
+                }
+            }
+
             $message = empty($error_msg)
                 ? '<p class="message">' . __('Please check your email for the 6-digit verification code.', 'bagels') . '</p>'
                 : '<div id="login_error">' . esc_html($error_msg) . '</div>';
@@ -839,27 +1113,36 @@ if (!class_exists('WP_Security_Hardening')) {
             if (isset($_REQUEST['do_access'])) {
                 $action_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $action_url);
             }
+            $login_page_url = $this->get_otp_login_url();
             ?>
-                                    <form name="otpform" id="otpform" action="<?php echo esc_url($action_url); ?>" method="post">
-                                        <?php wp_nonce_field('bagels_otp_verify', 'bagels_otp_nonce'); ?>
-                                        <p>
-                                            <label for="otp_code"><?php esc_html_e('Verification Code', 'bagels'); ?></label>
-                                            <input type="text" name="otp_code" id="otp_code" class="input" value="" size="20" autocomplete="off" required />
-                                        </p>
-                                        <?php if (isset($_REQUEST['redirect_to'])): ?>
-                                                    <input type="hidden" name="redirect_to" value="<?php echo esc_attr($_REQUEST['redirect_to']); ?>" />
-                                        <?php endif; ?>
+                                    <?php if ($hide_form): ?>
                                         <p class="submit">
-                                            <input type="submit" name="wp-submit" id="wp-submit" class="button button-primary button-large" value="<?php esc_attr_e('Verify Code', 'bagels'); ?>" />
+                                            <a class="button button-primary button-large" href="<?php echo esc_url($login_page_url); ?>">
+                                                <?php esc_html_e('Back to Login', 'bagels'); ?>
+                                            </a>
                                         </p>
-                                    </form>
-                                    <script type="text/javascript">
-                                        setTimeout(function() {
-                                            try {
-                                                document.getElementById('otp_code').focus();
-                                            } catch (e) {}
-                                        }, 200);
-                                    </script>
+                                    <?php else: ?>
+                                        <form name="otpform" id="otpform" action="<?php echo esc_url($action_url); ?>" method="post">
+                                            <?php wp_nonce_field('bagels_otp_verify', 'bagels_otp_nonce'); ?>
+                                            <p>
+                                                <label for="otp_code"><?php esc_html_e('Verification Code', 'bagels'); ?></label>
+                                                <input type="text" name="otp_code" id="otp_code" class="input" value="" size="20" autocomplete="off" required />
+                                            </p>
+                                            <?php if (isset($_REQUEST['redirect_to'])): ?>
+                                                        <input type="hidden" name="redirect_to" value="<?php echo esc_attr($_REQUEST['redirect_to']); ?>" />
+                                            <?php endif; ?>
+                                            <p class="submit">
+                                                <input type="submit" name="wp-submit" id="wp-submit" class="button button-primary button-large" value="<?php esc_attr_e('Verify Code', 'bagels'); ?>" />
+                                            </p>
+                                        </form>
+                                        <script type="text/javascript">
+                                            setTimeout(function() {
+                                                try {
+                                                    document.getElementById('otp_code').focus();
+                                                } catch (e) {}
+                                            }, 200);
+                                        </script>
+                                    <?php endif; ?>
                                     <?php
                                     login_footer();
                                     exit;
@@ -880,19 +1163,9 @@ if (!class_exists('WP_Security_Hardening')) {
                 $this->render_otp_form(__('Security check failed. Please try again.', 'bagels'));
             }
 
-            $token = isset($_COOKIE['bagels_otp_token']) ? $_COOKIE['bagels_otp_token'] : '';
-            if (empty($token)) {
+            $decoded = $this->get_otp_context_from_cookie();
+            if (!$decoded) {
                 $this->render_otp_form(__('Session expired. Please log in again.', 'bagels'));
-            }
-
-            $decoded = json_decode(base64_decode($token), true);
-            if (!$decoded || empty($decoded['user_id']) || empty($decoded['hash'])) {
-                $this->render_otp_form(__('Invalid session.', 'bagels'));
-            }
-
-            $expected_hash = hash_hmac('sha256', $decoded['user_id'] . $decoded['remember'] . $decoded['time'], wp_salt());
-            if (!hash_equals($expected_hash, $decoded['hash'])) {
-                $this->render_otp_form(__('Security validation failed.', 'bagels'));
             }
 
             if (time() - $decoded['time'] > 10 * MINUTE_IN_SECONDS) {
@@ -900,11 +1173,22 @@ if (!class_exists('WP_Security_Hardening')) {
             }
 
             $user_id = $decoded['user_id'];
+            $attempts_key = $this->get_otp_attempts_key($user_id);
+            $max_attempts = $this->get_otp_max_attempts();
+            $attempts_made = (int) get_transient($attempts_key);
+
+            if ($attempts_made >= $max_attempts) {
+                delete_transient('bagels_otp_' . $user_id);
+                setcookie('bagels_otp_token', '', time() - 3600, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
+                $this->render_otp_form(__('Maximum verification attempts reached. Please log in again.', 'bagels'), true);
+            }
+
             $entered_otp = sanitize_text_field($_POST['otp_code']);
             $stored_otp = get_transient('bagels_otp_' . $user_id);
 
             if ($stored_otp !== false && hash_equals((string) $stored_otp, $entered_otp)) {
                 delete_transient('bagels_otp_' . $user_id);
+                delete_transient($attempts_key);
                 setcookie('bagels_otp_token', '', time() - 3600, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
 
                 wp_set_current_user($user_id);
@@ -918,16 +1202,50 @@ if (!class_exists('WP_Security_Hardening')) {
                 exit;
             }
 
-            $this->render_otp_form(__('Invalid verification code.', 'bagels'));
+            $attempts_made++;
+            set_transient($attempts_key, $attempts_made, 10 * MINUTE_IN_SECONDS);
+
+            if ($attempts_made >= $max_attempts) {
+                delete_transient('bagels_otp_' . $user_id);
+                setcookie('bagels_otp_token', '', time() - 3600, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
+                $this->render_otp_form(__('Maximum verification attempts reached. Please log in again.', 'bagels'), true);
+            }
+
+            $remaining_attempts = max(0, $max_attempts - $attempts_made);
+            $this->render_otp_form(
+                sprintf(
+                    /* translators: %d: remaining verification attempts */
+                    __('Invalid verification code. Attempts remaining: %d', 'bagels'),
+                    (int) $remaining_attempts
+                )
+            );
         }
 
     }
     add_filter('rest_pre_dispatch', function ($result, $server, $request) {
-        if (!is_user_logged_in() && strpos($request->get_route(), '/wp/v2/users') !== false) {
-            return new WP_Error('rest_forbidden', 'Sorry, you are not allowed.', ['status' => 403]);
+
+        if (
+            strpos($request->get_route(), '/wp/v2/users') !== false &&
+            !current_user_can('list_users')
+        ) {
+            return new WP_Error(
+                'rest_forbidden',
+                'Sorry, you are not allowed.',
+                ['status' => 403]
+            );
         }
+
         return $result;
+
     }, 10, 3);
+    
+    add_filter('wp_is_application_passwords_available_for_user', function ($available, $user) {
+    // Only allow for administrators
+    if (!user_can($user, 'manage_options')) {
+        return false;
+    }
+    return $available;
+}, 10, 2);
 
     new WP_Security_Hardening();
 }
