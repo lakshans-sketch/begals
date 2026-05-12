@@ -24,23 +24,83 @@ if (!class_exists('WP_Security_Hardening')) {
         );
 
         private $whitelisted_ips = array();
+        private $login_guard_table = '';
 
         public function __construct()
         {
+            global $wpdb;
+
             $this->geoip_db_path = defined('BAGELS_GEOLITE2_DIRECTORY') ? BAGELS_GEOLITE2_DIRECTORY . '/GeoLite2-Country.mmdb' : '';
+            $this->login_guard_table = $wpdb->prefix . 'bagels_login_guard';
             $this->init();
         }
 
         private function init()
         {
+            $this->ensure_login_guard_table_exists();
+
             $this->allowed_countries = apply_filters('bagels_allowed_countries', $this->allowed_countries);
             $this->whitelisted_ips = apply_filters('bagels_whitelisted_ips', $this->whitelisted_ips);
 
             add_action('init', array($this, 'handle_security_checks'));
             add_filter('authenticate', array($this, 'block_bruteforce_authentication'), 1, 3);
-            add_action('wp_login_failed', array($this, 'record_failed_login'));
+            add_filter('authenticate', array($this, 'trigger_otp_challenge'), 30, 3);
+            add_action('wp_login_failed', array($this, 'record_failed_login'), 10, 2);
             add_action('wp_login', array($this, 'clear_failed_login_attempts'));
             add_filter('rest_authentication_errors', array($this, 'protect_rest_authentication'));
+            add_action('login_form_bagels_otp', array($this, 'render_otp_form'));
+            add_action('login_form_bagels_otp_verify', array($this, 'process_otp'));
+            add_filter('login_message', array($this, 'render_login_attempt_notice'));
+            add_action('login_head', array($this, 'hide_login_form_during_lockout'));
+        }
+
+        private function ensure_login_guard_table_exists()
+        {
+            static $table_checked = false;
+
+            if ($table_checked) {
+                return;
+            }
+
+            global $wpdb;
+
+            $table_checked = true;
+
+            if (!defined('ABSPATH')) {
+                return;
+            }
+
+            $charset_collate = $wpdb->get_charset_collate();
+            $table_name = $this->login_guard_table;
+            $table_exists = $wpdb->get_var(
+                $wpdb->prepare('SHOW TABLES LIKE %s', $table_name)
+            ) === $table_name;
+
+            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+            $sql = "CREATE TABLE {$table_name} (
+                id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+                ip_hash CHAR(32) NOT NULL,
+                ip_address VARCHAR(45) NOT NULL DEFAULT '',
+                stage_index SMALLINT(5) UNSIGNED NOT NULL DEFAULT 0,
+                attempts_in_stage SMALLINT(5) UNSIGNED NOT NULL DEFAULT 0,
+                lock_until BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+                total_failures INT(10) UNSIGNED NOT NULL DEFAULT 0,
+                permanent_block TINYINT(1) UNSIGNED NOT NULL DEFAULT 0,
+                permanent_blocked_at BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY  (id),
+                UNIQUE KEY ip_hash (ip_hash),
+                KEY lock_until (lock_until),
+                KEY permanent_block (permanent_block)
+            ) {$charset_collate};";
+
+            dbDelta($sql);
+
+            if (!$table_exists) {
+                error_log('Created login guard table: ' . $table_name);
+            }
         }
 
         private function load_geoip()
@@ -192,20 +252,38 @@ if (!class_exists('WP_Security_Hardening')) {
         private function get_user_ip()
         {
             if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
-                $ip = trim($_SERVER['HTTP_CF_CONNECTING_IP']);
+                $ip = trim((string) $_SERVER['HTTP_CF_CONNECTING_IP']);
+                $ip = explode(',', $ip)[0];
+                $ip = $this->normalize_ip(trim($ip));
 
                 if (filter_var($ip, FILTER_VALIDATE_IP)) {
                     return sanitize_text_field($ip);
                 }
             }
 
-            $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+            $ip = isset($_SERVER['REMOTE_ADDR']) ? $this->normalize_ip(trim((string) $_SERVER['REMOTE_ADDR'])) : '';
 
             if (filter_var($ip, FILTER_VALIDATE_IP)) {
                 return sanitize_text_field($ip);
             }
 
             return '0.0.0.0';
+        }
+
+        private function normalize_ip($ip)
+        {
+            if ($ip === '::1') {
+                return '127.0.0.1';
+            }
+
+            if (stripos($ip, '::ffff:') === 0) {
+                $ipv4 = substr($ip, 7);
+                if (filter_var($ipv4, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                    return $ipv4;
+                }
+            }
+
+            return $ip;
         }
 
         private function get_country_from_ip($ip)
@@ -330,40 +408,73 @@ if (!class_exists('WP_Security_Hardening')) {
             }
 
             if ($this->has_too_many_failed_logins()) {
+                $state = $this->get_failed_login_state();
+                $message = esc_html__('Access denied.', 'bagels');
+
+                if (!empty($state['permanent_block'])) {
+                    $message = esc_html__('This IP address is permanently blocked. Please contact the site administrator.', 'bagels');
+                } elseif ((int) $state['lock_until'] > time()) {
+                    $remaining = (int) $state['lock_until'] - time();
+                    $message = sprintf(
+                        /* translators: %s: Human readable duration */
+                        esc_html__('Too many failed login attempts. Try again in %s.', 'bagels'),
+                        esc_html(human_time_diff(time(), time() + max(1, $remaining)))
+                    );
+                }
+
                 return new WP_Error(
                     'bagels_too_many_login_attempts',
-                    esc_html__('Access denied.', 'bagels')
+                    $message
                 );
             }
 
             return $user;
         }
 
-        public function record_failed_login()
+        public function record_failed_login($username = '', $error = null)
         {
             if (!$this->is_standard_login_request()) {
                 return;
             }
 
-            $key = $this->get_failed_login_transient_key();
-            $attempts = (int) get_transient($key);
-            $limit = (int) apply_filters('bagels_failed_login_limit', 10);
-
-            $attempts++;
-
-            set_transient($key, $attempts, HOUR_IN_SECONDS);
-
-            if ($attempts >= $limit) {
-                set_transient($key . '_blocked', time(), 15 * MINUTE_IN_SECONDS);
+            if ($this->is_ip_permanently_blocked()) {
+                return;
             }
+
+            $state = $this->get_failed_login_state();
+            $now = time();
+
+            // Ignore retries while already in a timed lockout window.
+            if ((int) $state['lock_until'] > $now) {
+                return;
+            }
+
+            $policies = $this->get_bruteforce_lock_policies();
+            $stage_index = (int) $state['stage_index'];
+            $active_policy = $policies[min($stage_index, count($policies) - 1)];
+
+            $state['attempts_in_stage'] = (int) $state['attempts_in_stage'] + 1;
+            $state['total_failures'] = (int) $state['total_failures'] + 1;
+
+            if ((int) $state['attempts_in_stage'] >= (int) $active_policy['attempts']) {
+                $state['attempts_in_stage'] = 0;
+
+                if (!empty($active_policy['permanent_block'])) {
+                    $state['permanent_block'] = true;
+                    $state['permanent_blocked_at'] = $now;
+                    $state['lock_until'] = 0;
+                } else {
+                    $state['lock_until'] = $now + (int) $active_policy['lock_seconds'];
+                    $state['stage_index'] = $stage_index + 1;
+                }
+            }
+
+            $this->set_failed_login_state($state);
         }
 
         public function clear_failed_login_attempts($user_login = '')
         {
-            $key = $this->get_failed_login_transient_key();
-
-            delete_transient($key);
-            delete_transient($key . '_blocked');
+            $this->clear_failed_login_state();
         }
 
         public function protect_rest_authentication($result)
@@ -383,20 +494,214 @@ if (!class_exists('WP_Security_Hardening')) {
             return $result;
         }
 
+        public function render_login_attempt_notice($message)
+        {
+            if (!$this->is_standard_login_request()) {
+                return $message;
+            }
+
+            $current_action = isset($_REQUEST['action']) ? sanitize_key(wp_unslash($_REQUEST['action'])) : '';
+            if (in_array($current_action, array('bagels_otp', 'bagels_otp_verify'), true)) {
+                return $message;
+            }
+
+            $state = $this->get_failed_login_state();
+            $now = time();
+            $notice = '';
+
+            if (!empty($state['permanent_block'])) {
+                $notice = esc_html__('This IP address is permanently blocked. Please contact the site administrator.', 'bagels');
+                return $message . '<div id="login_error">' . esc_html($notice) . '</div>';
+            }
+
+            if ((int) $state['lock_until'] > $now) {
+                $remaining = (int) $state['lock_until'] - $now;
+                $notice = sprintf(
+                    /* translators: %s: Human readable duration */
+                    esc_html__('Too many failed login attempts. Try again in %s.', 'bagels'),
+                    esc_html(human_time_diff($now, $now + max(1, $remaining)))
+                );
+
+                return $message . '<div id="login_error">' . esc_html($notice) . '</div>';
+            }
+
+            if ((int) $state['total_failures'] > 0) {
+                $policies = $this->get_bruteforce_lock_policies();
+                $stage_index = (int) $state['stage_index'];
+                $active_policy = $policies[min($stage_index, count($policies) - 1)];
+                $allowed_attempts = max(1, (int) $active_policy['attempts']);
+                $attempts_left = max(0, $allowed_attempts - (int) $state['attempts_in_stage']);
+
+                if ($attempts_left > 0) {
+                    $notice = sprintf(
+                        /* translators: %d: Remaining attempts */
+                        esc_html__('Login attempts left before lock: %d', 'bagels'),
+                        (int) $attempts_left
+                    );
+
+                    return $message . '<p class="message">' . esc_html($notice) . '</p>';
+                }
+            }
+
+            return $message;
+        }
+
+        public function hide_login_form_during_lockout()
+        {
+            if (!$this->is_standard_login_request()) {
+                return;
+            }
+
+            $current_action = isset($_REQUEST['action']) ? sanitize_key(wp_unslash($_REQUEST['action'])) : '';
+            if (in_array($current_action, array('bagels_otp', 'bagels_otp_verify'), true)) {
+                return;
+            }
+
+            if (!$this->has_too_many_failed_logins()) {
+                return;
+            }
+            ?>
+                                    <style>
+                                        #loginform > p,
+                                        #loginform .user-pass-wrap,
+                                        #loginform .forgetmenot,
+                                        #loginform .submit {
+                                            display: none !important;
+                                        }
+                                    </style>
+                                    <?php
+        }
+
         private function has_too_many_failed_logins()
         {
-            $limit = (int) apply_filters('bagels_failed_login_limit', 10);
-            $key = $this->get_failed_login_transient_key();
+            if ($this->is_ip_permanently_blocked()) {
+                return true;
+            }
 
-            return (
-                (bool) get_transient($key . '_blocked') ||
-                ((int) get_transient($key)) >= $limit
+            $state = $this->get_failed_login_state();
+
+            return (int) $state['lock_until'] > time();
+        }
+
+        private function get_user_ip_hash()
+        {
+            return md5($this->get_user_ip());
+        }
+
+        private function get_default_failed_login_state()
+        {
+            return array(
+                'stage_index' => 0,
+                'attempts_in_stage' => 0,
+                'lock_until' => 0,
+                'total_failures' => 0,
+                'permanent_block' => false,
+                'permanent_blocked_at' => 0,
             );
         }
 
-        private function get_failed_login_transient_key()
+        private function get_failed_login_state()
         {
-            return 'bagels_login_attempt_' . md5($this->get_user_ip() . '|' . $this->get_user_agent());
+            global $wpdb;
+
+            $defaults = $this->get_default_failed_login_state();
+            $row = $wpdb->get_row(
+                $wpdb->prepare(
+                    "SELECT stage_index, attempts_in_stage, lock_until, total_failures, permanent_block, permanent_blocked_at
+                     FROM {$this->login_guard_table}
+                     WHERE ip_hash = %s
+                     LIMIT 1",
+                    $this->get_user_ip_hash()
+                ),
+                ARRAY_A
+            );
+
+            if (!is_array($row)) {
+                return $defaults;
+            }
+
+            return array(
+                'stage_index' => isset($row['stage_index']) ? (int) $row['stage_index'] : $defaults['stage_index'],
+                'attempts_in_stage' => isset($row['attempts_in_stage']) ? (int) $row['attempts_in_stage'] : $defaults['attempts_in_stage'],
+                'lock_until' => isset($row['lock_until']) ? (int) $row['lock_until'] : $defaults['lock_until'],
+                'total_failures' => isset($row['total_failures']) ? (int) $row['total_failures'] : $defaults['total_failures'],
+                'permanent_block' => !empty($row['permanent_block']),
+                'permanent_blocked_at' => isset($row['permanent_blocked_at']) ? (int) $row['permanent_blocked_at'] : $defaults['permanent_blocked_at'],
+            );
+        }
+
+        private function set_failed_login_state($state)
+        {
+            global $wpdb;
+
+            $ip = $this->get_user_ip();
+            $ip_hash = $this->get_user_ip_hash();
+            $stage_index = isset($state['stage_index']) ? (int) $state['stage_index'] : 0;
+            $attempts_in_stage = isset($state['attempts_in_stage']) ? (int) $state['attempts_in_stage'] : 0;
+            $lock_until = isset($state['lock_until']) ? (int) $state['lock_until'] : 0;
+            $total_failures = isset($state['total_failures']) ? (int) $state['total_failures'] : 0;
+            $permanent_block = !empty($state['permanent_block']) ? 1 : 0;
+            $permanent_blocked_at = isset($state['permanent_blocked_at']) ? (int) $state['permanent_blocked_at'] : 0;
+            $now_mysql = current_time('mysql', 1);
+
+            $wpdb->query(
+                $wpdb->prepare(
+                    "INSERT INTO {$this->login_guard_table}
+                        (ip_hash, ip_address, stage_index, attempts_in_stage, lock_until, total_failures, permanent_block, permanent_blocked_at, created_at, updated_at)
+                     VALUES (%s, %s, %d, %d, %d, %d, %d, %d, %s, %s)
+                     ON DUPLICATE KEY UPDATE
+                        ip_address = VALUES(ip_address),
+                        stage_index = VALUES(stage_index),
+                        attempts_in_stage = VALUES(attempts_in_stage),
+                        lock_until = VALUES(lock_until),
+                        total_failures = VALUES(total_failures),
+                        permanent_block = VALUES(permanent_block),
+                        permanent_blocked_at = VALUES(permanent_blocked_at),
+                        updated_at = VALUES(updated_at)",
+                    $ip_hash,
+                    $ip,
+                    $stage_index,
+                    $attempts_in_stage,
+                    $lock_until,
+                    $total_failures,
+                    $permanent_block,
+                    $permanent_blocked_at,
+                    $now_mysql,
+                    $now_mysql
+                )
+            );
+        }
+
+        private function get_bruteforce_lock_policies()
+        {
+            $policies = array(
+                array('attempts' => 3, 'lock_seconds' => HOUR_IN_SECONDS),
+                array('attempts' => 2, 'lock_seconds' => 2 * HOUR_IN_SECONDS),
+                array('attempts' => 1, 'lock_seconds' => 5 * HOUR_IN_SECONDS),
+                array('attempts' => 1, 'lock_seconds' => 10 * HOUR_IN_SECONDS),
+                array('attempts' => 1, 'lock_seconds' => DAY_IN_SECONDS),
+                array('attempts' => 1, 'lock_seconds' => 0, 'permanent_block' => true),
+            );
+
+            return apply_filters('bagels_bruteforce_lock_policies', $policies);
+        }
+
+        private function is_ip_permanently_blocked()
+        {
+            $state = $this->get_failed_login_state();
+
+            return !empty($state['permanent_block']);
+        }
+
+        private function clear_failed_login_state()
+        {
+            global $wpdb;
+
+            $wpdb->delete(
+                $this->login_guard_table,
+                array('ip_hash' => $this->get_user_ip_hash()),
+                array('%s')
+            );
         }
 
         private function is_standard_login_request()
@@ -449,15 +754,20 @@ if (!class_exists('WP_Security_Hardening')) {
         {
             status_header(404);
             nocache_headers();
+            // Load the theme's 404 template
+            $template = get_404_template();
+            if ($template) {
+                include $template;
+                exit;
+            }
+            // Fallback if no 404 template found
             wp_die(
                 esc_html__('Page not found.', 'bagels'),
                 esc_html__('404', 'bagels'),
                 array('response' => 404, 'back_link' => false)
             );
         }
-    }
-
-        function bagels_trigger_otp_challenge($user, $username, $password)
+        public function trigger_otp_challenge($user, $username, $password)
         {
             if (is_wp_error($user) || empty($user)) {
                 return $user;
@@ -516,10 +826,8 @@ if (!class_exists('WP_Security_Hardening')) {
             wp_safe_redirect($otp_url);
             exit;
         }
-    
 
-    
-        function bagels_render_otp_form($error_msg = '')
+        public function render_otp_form($error_msg = '')
         {
             $message = empty($error_msg)
                 ? '<p class="message">' . __('Please check your email for the 6-digit verification code.', 'bagels') . '</p>'
@@ -532,36 +840,32 @@ if (!class_exists('WP_Security_Hardening')) {
                 $action_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $action_url);
             }
             ?>
-            <form name="otpform" id="otpform" action="<?php echo esc_url($action_url); ?>" method="post">
-                <?php wp_nonce_field('bagels_otp_verify', 'bagels_otp_nonce'); ?>
-                <p>
-                    <label for="otp_code"><?php esc_html_e('Verification Code', 'bagels'); ?></label>
-                    <input type="text" name="otp_code" id="otp_code" class="input" value="" size="20" autocomplete="off" required />
-                </p>
-                <?php if (isset($_REQUEST['redirect_to'])) : ?>
-                    <input type="hidden" name="redirect_to" value="<?php echo esc_attr($_REQUEST['redirect_to']); ?>" />
-                <?php endif; ?>
-                <p class="submit">
-                    <input type="submit" name="wp-submit" id="wp-submit" class="button button-primary button-large" value="<?php esc_attr_e('Verify Code', 'bagels'); ?>" />
-                </p>
-            </form>
-            <p id="backtoblog">
-                <a href="<?php echo esc_url(home_url('/')); ?>">&larr; <?php echo esc_html(sprintf(__('Go to %s', 'bagels'), get_bloginfo('name'))); ?></a>
-            </p>
-            <script type="text/javascript">
-                setTimeout(function() {
-                    try {
-                        document.getElementById('otp_code').focus();
-                    } catch (e) {}
-                }, 200);
-            </script>
-            <?php
-            login_footer();
-            exit;
+                                    <form name="otpform" id="otpform" action="<?php echo esc_url($action_url); ?>" method="post">
+                                        <?php wp_nonce_field('bagels_otp_verify', 'bagels_otp_nonce'); ?>
+                                        <p>
+                                            <label for="otp_code"><?php esc_html_e('Verification Code', 'bagels'); ?></label>
+                                            <input type="text" name="otp_code" id="otp_code" class="input" value="" size="20" autocomplete="off" required />
+                                        </p>
+                                        <?php if (isset($_REQUEST['redirect_to'])): ?>
+                                                    <input type="hidden" name="redirect_to" value="<?php echo esc_attr($_REQUEST['redirect_to']); ?>" />
+                                        <?php endif; ?>
+                                        <p class="submit">
+                                            <input type="submit" name="wp-submit" id="wp-submit" class="button button-primary button-large" value="<?php esc_attr_e('Verify Code', 'bagels'); ?>" />
+                                        </p>
+                                    </form>
+                                    <script type="text/javascript">
+                                        setTimeout(function() {
+                                            try {
+                                                document.getElementById('otp_code').focus();
+                                            } catch (e) {}
+                                        }, 200);
+                                    </script>
+                                    <?php
+                                    login_footer();
+                                    exit;
         }
-    
 
-        function bagels_process_otp()
+        public function process_otp()
         {
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
                 $redirect_url = wp_login_url();
@@ -573,26 +877,26 @@ if (!class_exists('WP_Security_Hardening')) {
             }
 
             if (!isset($_POST['bagels_otp_nonce']) || !wp_verify_nonce($_POST['bagels_otp_nonce'], 'bagels_otp_verify')) {
-                bagels_render_otp_form(__('Security check failed. Please try again.', 'bagels'));
+                $this->render_otp_form(__('Security check failed. Please try again.', 'bagels'));
             }
 
             $token = isset($_COOKIE['bagels_otp_token']) ? $_COOKIE['bagels_otp_token'] : '';
             if (empty($token)) {
-                bagels_render_otp_form(__('Session expired. Please log in again.', 'bagels'));
+                $this->render_otp_form(__('Session expired. Please log in again.', 'bagels'));
             }
 
             $decoded = json_decode(base64_decode($token), true);
             if (!$decoded || empty($decoded['user_id']) || empty($decoded['hash'])) {
-                bagels_render_otp_form(__('Invalid session.', 'bagels'));
+                $this->render_otp_form(__('Invalid session.', 'bagels'));
             }
 
             $expected_hash = hash_hmac('sha256', $decoded['user_id'] . $decoded['remember'] . $decoded['time'], wp_salt());
             if (!hash_equals($expected_hash, $decoded['hash'])) {
-                bagels_render_otp_form(__('Security validation failed.', 'bagels'));
+                $this->render_otp_form(__('Security validation failed.', 'bagels'));
             }
 
             if (time() - $decoded['time'] > 10 * MINUTE_IN_SECONDS) {
-                bagels_render_otp_form(__('Verification code expired.', 'bagels'));
+                $this->render_otp_form(__('Verification code expired.', 'bagels'));
             }
 
             $user_id = $decoded['user_id'];
@@ -614,13 +918,16 @@ if (!class_exists('WP_Security_Hardening')) {
                 exit;
             }
 
-            bagels_render_otp_form(__('Invalid verification code.', 'bagels'));
+            $this->render_otp_form(__('Invalid verification code.', 'bagels'));
         }
 
-    new WP_Security_Hardening();
+    }
+    add_filter('rest_pre_dispatch', function ($result, $server, $request) {
+        if (!is_user_logged_in() && strpos($request->get_route(), '/wp/v2/users') !== false) {
+            return new WP_Error('rest_forbidden', 'Sorry, you are not allowed.', ['status' => 403]);
+        }
+        return $result;
+    }, 10, 3);
 
-    // Run after core auth and brute-force checks.
-    add_filter('authenticate', 'bagels_trigger_otp_challenge', 30, 3);
-    add_action('login_form_bagels_otp', 'bagels_render_otp_form');
-    add_action('login_form_bagels_otp_verify', 'bagels_process_otp');
+    new WP_Security_Hardening();
 }

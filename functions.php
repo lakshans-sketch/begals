@@ -168,9 +168,3 @@ function bagels_body_classes( $classes ) {
     return $classes;
 }
 
-add_filter('rest_pre_dispatch', function($result, $server, $request) {
-    if (!is_user_logged_in() && strpos($request->get_route(), '/wp/v2/users') !== false) {
-        return new WP_Error('rest_forbidden', 'Sorry, you are not allowed.', ['status' => 403]);
-    }
-    return $result;
-}, 10, 3);
