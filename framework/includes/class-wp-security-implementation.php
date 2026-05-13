@@ -20,7 +20,7 @@ if (!class_exists('WP_Security_Hardening')) {
         private $geoip_reader = null;
 
         private $allowed_countries = array(
-            "IND",
+            "LK",
         );
 
         private $whitelisted_ips = array(
@@ -60,6 +60,8 @@ if (!class_exists('WP_Security_Hardening')) {
             add_filter('retrieve_password_message', array($this, 'filter_retrieve_password_message'), 10, 4);
             add_filter('wp_new_user_notification_email', array($this, 'filter_new_user_notification_email'), 10, 3);
             add_action('wp_set_password', array($this, 'invalidate_sessions_after_password_change'), 10, 3);
+            // Keep WP reauth flow untouched (default behavior).
+            
         }
 
         private function ensure_login_guard_table_exists()
@@ -188,6 +190,18 @@ if (!class_exists('WP_Security_Hardening')) {
         private function is_protected_request($request_uri)
         {
             $path = $this->get_request_path($request_uri);
+            $is_reauth_login = (
+                strpos($path, 'wp-login.php') === 0 &&
+                (
+                    (isset($_REQUEST['reauth']) && (string) $_REQUEST['reauth'] === '1') ||
+                    (isset($_REQUEST['interim-login']) && (string) $_REQUEST['interim-login'] === '1')
+                )
+            );
+
+            // Do not block WP's built-in session reauthentication flow.
+            if ($is_reauth_login) {
+                return false;
+            }
 
             if ($path === 'admin' || $path === 'admin/') {
                 return true;
@@ -223,6 +237,7 @@ if (!class_exists('WP_Security_Hardening')) {
         private function handle_do_access_route()
         {
             if (!$this->verify_do_access_token()) {
+                // Fresh visitor - full geo + IP check
                 $ip = $this->get_user_ip();
 
                 if (!empty($this->whitelisted_ips) && !$this->is_whitelisted_ip($ip)) {
@@ -235,9 +250,13 @@ if (!class_exists('WP_Security_Hardening')) {
                     $this->send_forbidden();
                 }
 
-                $this->set_do_access_token();
+                $this->set_do_access_token(true);
+                $this->redirect_to_login();
+                return;
             }
 
+            // Existing valid gate token; no fresh OTP intent.
+            $this->set_fresh_gate_login_cookie(false);
             $this->redirect_to_login();
         }
 
@@ -371,31 +390,76 @@ if (!class_exists('WP_Security_Hardening')) {
             return in_array($country, $this->allowed_countries, true);
         }
 
-        private function set_do_access_token()
+        private function set_do_access_token($mark_fresh_gate_login = false)
         {
-            $token = $this->generate_do_access_token();
+            $token   = bin2hex(random_bytes(32));
+            $ip      = $this->get_user_ip();
+            $expires = time() + DAY_IN_SECONDS; // 24hrs
+
+            set_transient(
+                'do_access_' . md5($token),
+                array('ip' => $ip, 'expires' => $expires),
+                DAY_IN_SECONDS
+            );
 
             setcookie(
                 'do_access_token',
                 $token,
                 array(
-                    'expires' => time() + 28800,
-                    'path' => '/',
-                    'secure' => is_ssl(),
+                    'expires'  => $expires,
+                    'path'     => '/',
+                    'secure'   => is_ssl(),
                     'httponly' => true,
-                    'samesite' => 'Lax',
+                    'samesite' => 'Strict',
                 )
             );
 
             $_COOKIE['do_access_token'] = $token;
+            $this->set_fresh_gate_login_cookie((bool) $mark_fresh_gate_login);
 
             return $token;
         }
 
+        private function set_fresh_gate_login_cookie($enabled)
+        {
+            $cookie_name = 'do_access_fresh_login';
+
+            if ($enabled) {
+                $expires = time() + (15 * MINUTE_IN_SECONDS);
+                setcookie(
+                    $cookie_name,
+                    '1',
+                    array(
+                        'expires'  => $expires,
+                        'path'     => '/',
+                        'secure'   => is_ssl(),
+                        'httponly' => true,
+                        'samesite' => 'Strict',
+                    )
+                );
+                $_COOKIE[$cookie_name] = '1';
+                return;
+            }
+
+            setcookie(
+                $cookie_name,
+                '',
+                array(
+                    'expires'  => time() - HOUR_IN_SECONDS,
+                    'path'     => '/',
+                    'secure'   => is_ssl(),
+                    'httponly' => true,
+                    'samesite' => 'Strict',
+                )
+            );
+            unset($_COOKIE[$cookie_name]);
+        }
+
         private function redirect_to_login()
         {
-            $login_args = $this->get_forwarded_login_query_args();
-            $login_url = add_query_arg($login_args, wp_login_url());
+            $login_args    = $this->get_forwarded_login_query_args();
+            $raw_login_url = site_url('wp-login.php', 'login');
+            $login_url     = add_query_arg($login_args, $raw_login_url);
 
             wp_safe_redirect($login_url);
             exit;
@@ -549,57 +613,50 @@ if (!class_exists('WP_Security_Hardening')) {
                 wp_destroy_current_session();
                 wp_clear_auth_cookie();
 
+                // Also revoke gate token so user must re-pass geo check
+                $this->revoke_do_access_token();
+                setcookie('do_access_token', '', time() - 3600, '/', '', is_ssl(), true);
+
                 if (function_exists('WC') && WC() && WC()->session) {
                     WC()->session->destroy_session();
                 }
             }
         }
 
-        private function generate_do_access_token()
-        {
-            $ip = $this->get_user_ip();
-            $user_agent = $this->get_user_agent();
-            $time = time();
-            $secret = defined('AUTH_KEY') ? AUTH_KEY : 'do-access-fallback-secret';
-            $hash = hash_hmac('sha256', $ip . '|' . $user_agent . '|' . $time, $secret);
+        // private function generate_do_access_token()
+        // {
+        //     $ip = $this->get_user_ip();
+        //     $user_agent = $this->get_user_agent();
+        //     $time = time();
+        //     $secret = defined('AUTH_KEY') ? AUTH_KEY : 'do-access-fallback-secret';
+        //     $hash = hash_hmac('sha256', $ip . '|' . $user_agent . '|' . $time, $secret);
 
-            return base64_encode($time . '|' . $hash);
-        }
+        //     return base64_encode($time . '|' . $hash);
+        // }
 
         private function verify_do_access_token()
         {
             $token = $_COOKIE['do_access_token'] ?? '';
 
-            if (empty($token) && isset($_GET['do_access']) && is_scalar($_GET['do_access'])) {
-                $token = sanitize_text_field(wp_unslash($_GET['do_access']));
-                $_COOKIE['do_access_token'] = $token;
-            }
-
             if (empty($token)) {
                 return false;
             }
 
-            // Fix base64 '+' characters getting converted to spaces in $_GET
-            $token = str_replace(' ', '+', $token);
+            $record = get_transient('do_access_' . md5($token));
 
-            $secret = defined('AUTH_KEY') ? AUTH_KEY : 'do-access-fallback-secret';
-            $decoded = base64_decode($token, true);
-
-            if ($decoded === false || substr_count($decoded, '|') !== 1) {
+            if (empty($record) || empty($record['ip']) || empty($record['expires'])) {
                 return false;
             }
 
-            list($time, $hash) = explode('|', $decoded, 2);
-
-            if ((time() - (int) $time) > 28800) {
+            if ($record['ip'] !== $this->get_user_ip()) {
                 return false;
             }
 
-            $ip = $this->get_user_ip();
-            $user_agent = $this->get_user_agent();
-            $expected_hash = hash_hmac('sha256', $ip . '|' . $user_agent . '|' . $time, $secret);
+            if ($record['expires'] < time()) {
+                return false;
+            }
 
-            return hash_equals($expected_hash, $hash);
+            return true;
         }
 
         public function block_bruteforce_authentication($user, $username, $password)
@@ -1000,6 +1057,18 @@ if (!class_exists('WP_Security_Hardening')) {
                 return $user;
             }
 
+            // WP session reauth — skip OTP, just password is enough
+            $is_reauth = isset($_REQUEST['reauth']) && $_REQUEST['reauth'] == '1';
+            if ($is_reauth) {
+                return $user;
+            }
+
+            // OTP only for fresh gate logins.
+            $is_fresh_gate_login = isset($_COOKIE['do_access_fresh_login']) && (string) $_COOKIE['do_access_fresh_login'] === '1';
+            if (!$is_fresh_gate_login) {
+                return $user;
+            }
+
             $otp = wp_rand(100000, 999999);
             set_transient('bagels_otp_' . $user->ID, $otp, 10 * MINUTE_IN_SECONDS);
             delete_transient($this->get_otp_attempts_key($user->ID));
@@ -1040,11 +1109,11 @@ if (!class_exists('WP_Security_Hardening')) {
                 site_url('wp-login.php', 'login')
             );
 
-            if (isset($_REQUEST['do_access'])) {
-                $otp_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $otp_url);
-            } elseif (isset($_COOKIE['do_access_token'])) {
-                $otp_url = add_query_arg('do_access', rawurlencode(wp_unslash($_COOKIE['do_access_token'])), $otp_url);
-            }
+            // if (isset($_REQUEST['do_access'])) {
+            //     $otp_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $otp_url);
+            // } elseif (isset($_COOKIE['do_access_token'])) {
+            //     $otp_url = add_query_arg('do_access', rawurlencode(wp_unslash($_COOKIE['do_access_token'])), $otp_url);
+            // }
 
             wp_safe_redirect($otp_url);
             exit;
@@ -1082,14 +1151,7 @@ if (!class_exists('WP_Security_Hardening')) {
 
         private function get_otp_login_url()
         {
-            $login_url = wp_login_url();
-            if (isset($_REQUEST['do_access'])) {
-                $login_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $login_url);
-            } elseif (isset($_COOKIE['do_access_token'])) {
-                $login_url = add_query_arg('do_access', rawurlencode(wp_unslash($_COOKIE['do_access_token'])), $login_url);
-            }
-
-            return $login_url;
+            return site_url('wp-login.php', 'login');
         }
 
         public function render_otp_form($error_msg = '', $force_hide_form = false)
@@ -1110,9 +1172,9 @@ if (!class_exists('WP_Security_Hardening')) {
             login_header(__('Enter OTP', 'bagels'), $message);
 
             $action_url = site_url('wp-login.php?action=bagels_otp_verify', 'login_post');
-            if (isset($_REQUEST['do_access'])) {
-                $action_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $action_url);
-            }
+            // if (isset($_REQUEST['do_access'])) {
+            //     $action_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $action_url);
+            // }
             $login_page_url = $this->get_otp_login_url();
             ?>
                                     <?php if ($hide_form): ?>
@@ -1150,14 +1212,19 @@ if (!class_exists('WP_Security_Hardening')) {
 
         public function process_otp()
         {
+            // if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            //     $redirect_url = wp_login_url();
+            //     // if (isset($_REQUEST['do_access'])) {
+            //     //     $redirect_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $redirect_url);
+            //     // }
+            //     wp_safe_redirect($redirect_url);
+            //     exit;
+            // }
+
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-                $redirect_url = wp_login_url();
-                if (isset($_REQUEST['do_access'])) {
-                    $redirect_url = add_query_arg('do_access', rawurlencode(wp_unslash($_REQUEST['do_access'])), $redirect_url);
-                }
-                wp_safe_redirect($redirect_url);
-                exit;
-            }
+            wp_safe_redirect(site_url('wp-login.php', 'login'));
+            exit;
+        }
 
             if (!isset($_POST['bagels_otp_nonce']) || !wp_verify_nonce($_POST['bagels_otp_nonce'], 'bagels_otp_verify')) {
                 $this->render_otp_form(__('Security check failed. Please try again.', 'bagels'));
@@ -1190,9 +1257,34 @@ if (!class_exists('WP_Security_Hardening')) {
                 delete_transient('bagels_otp_' . $user_id);
                 delete_transient($attempts_key);
                 setcookie('bagels_otp_token', '', time() - 3600, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
-
                 wp_set_current_user($user_id);
-                wp_set_auth_cookie($user_id, $decoded['remember'], is_ssl());
+                $remember = !empty($decoded['remember']);
+
+                $default_expiry_ts = time() + ($remember ? (14 * DAY_IN_SECONDS) : (2 * DAY_IN_SECONDS));
+                $gate_expiry_ts = 0;
+                $gate_token = isset($_COOKIE['do_access_token']) ? sanitize_text_field(wp_unslash($_COOKIE['do_access_token'])) : '';
+
+                if ($gate_token !== '') {
+                    $gate_record = get_transient('do_access_' . md5($gate_token));
+                    if (is_array($gate_record) && !empty($gate_record['expires'])) {
+                        $gate_expiry_ts = (int) $gate_record['expires'];
+                    }
+                }
+
+                if ($gate_expiry_ts <= 0) {
+                    $gate_expiry_ts = time() + DAY_IN_SECONDS;
+                }
+
+                $min_expiry_ts = $gate_expiry_ts + (6 * HOUR_IN_SECONDS);
+                $wp_expiry_ts = max($default_expiry_ts, $min_expiry_ts);
+                $cookie_expiry_filter = function($length, $uid, $rem) use ($wp_expiry_ts) {
+                    return max(1, $wp_expiry_ts - time());
+                };
+
+                add_filter('auth_cookie_expiration', $cookie_expiry_filter, 99, 3);
+                wp_set_auth_cookie($user_id, $remember, is_ssl());
+                remove_filter('auth_cookie_expiration', $cookie_expiry_filter, 99);
+                $this->set_fresh_gate_login_cookie(false);
 
                 $user = get_userdata($user_id);
                 do_action('wp_login', $user->user_login, $user);
@@ -1219,6 +1311,13 @@ if (!class_exists('WP_Security_Hardening')) {
                     (int) $remaining_attempts
                 )
             );
+        }
+        private function revoke_do_access_token()
+        {
+            $token = $_COOKIE['do_access_token'] ?? '';
+            if (!empty($token)) {
+                delete_transient('do_access_' . md5($token));
+            }
         }
 
     }
