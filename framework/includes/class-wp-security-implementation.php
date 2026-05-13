@@ -8,9 +8,17 @@
  * @package    Bagels
  * @subpackage Security
  * @author     DoMedia
- * @version    1.0.0
+ * @version    1.0.1
  */
 
+if (
+    isset($_SERVER['REQUEST_URI']) &&
+    strpos($_SERVER['REQUEST_URI'], 'xmlrpc.php') !== false
+) {
+    http_response_code(403);
+    header('Content-Type: text/plain');
+    exit('Access denied.');
+}
 if (!class_exists('WP_Security_Hardening')) {
 
     class WP_Security_Hardening
@@ -27,6 +35,7 @@ if (!class_exists('WP_Security_Hardening')) {
             // "112.134.175.92"
         );
         private $login_guard_table = '';
+        private $gate_state_table = '';
 
         public function __construct()
         {
@@ -34,36 +43,58 @@ if (!class_exists('WP_Security_Hardening')) {
 
             $this->geoip_db_path = defined('BAGELS_GEOLITE2_DIRECTORY') ? BAGELS_GEOLITE2_DIRECTORY . '/GeoLite2-Country.mmdb' : '';
             $this->login_guard_table = $wpdb->prefix . 'bagels_login_guard';
+            $this->gate_state_table = $wpdb->prefix . 'bagels_gate_state';
             $this->init();
         }
 
         private function init()
         {
             $this->ensure_login_guard_table_exists();
+            $this->ensure_gate_state_table_exists();
 
             $this->allowed_countries = apply_filters('bagels_allowed_countries', $this->allowed_countries);
             $this->whitelisted_ips = apply_filters('bagels_whitelisted_ips', $this->whitelisted_ips);
             $this->whitelisted_ips = $this->sanitize_ip_list($this->whitelisted_ips);
 
+            $this->register_access_hooks();
+            $this->register_login_security_hooks();
+            $this->register_otp_hooks();
+            $this->register_password_recovery_hooks();
+        }
+
+        private function register_access_hooks()
+        {
             add_action('init', array($this, 'handle_security_checks'));
+            add_filter('rest_authentication_errors', array($this, 'protect_rest_authentication'));
+        }
+
+        private function register_login_security_hooks()
+        {
             add_filter('authenticate', array($this, 'block_bruteforce_authentication'), 1, 3);
             add_filter('authenticate', array($this, 'trigger_otp_challenge'), 30, 3);
             add_action('wp_login_failed', array($this, 'record_failed_login'), 10, 2);
             add_action('wp_login', array($this, 'clear_failed_login_attempts'));
-            add_filter('rest_authentication_errors', array($this, 'protect_rest_authentication'));
-            add_action('login_form_bagels_otp', array($this, 'render_otp_form'));
-            add_action('login_form_bagels_otp_verify', array($this, 'process_otp'));
             add_filter('login_message', array($this, 'render_login_attempt_notice'));
             add_action('login_head', array($this, 'hide_login_form_during_lockout'));
+            add_action('login_head', array($this, 'hide_remember_me_option'));
+            add_action('wp_set_password', array($this, 'invalidate_sessions_after_password_change'), 10, 3);
+        }
+
+        private function register_otp_hooks()
+        {
+            add_action('login_form_bagels_otp', array($this, 'render_otp_form'));
+            add_action('login_form_bagels_otp_verify', array($this, 'process_otp'));
+        }
+
+        private function register_password_recovery_hooks()
+        {
             add_filter('lostpassword_url', array($this, 'filter_lostpassword_url'), 10, 2);
             add_filter('retrieve_password_notification_email', array($this, 'filter_retrieve_password_notification_email'), 10, 4);
             add_filter('retrieve_password_message', array($this, 'filter_retrieve_password_message'), 10, 4);
             add_filter('wp_new_user_notification_email', array($this, 'filter_new_user_notification_email'), 10, 3);
-            add_action('wp_set_password', array($this, 'invalidate_sessions_after_password_change'), 10, 3);
-            // Keep WP reauth flow untouched (default behavior).
-            
         }
 
+        // Bootstrap: persistence tables.
         private function ensure_login_guard_table_exists()
         {
             static $table_checked = false;
@@ -113,6 +144,46 @@ if (!class_exists('WP_Security_Hardening')) {
             }
         }
 
+        private function ensure_gate_state_table_exists()
+        {
+            static $table_checked = false;
+
+            if ($table_checked) {
+                return;
+            }
+
+            global $wpdb;
+
+            $table_checked = true;
+
+            if (!defined('ABSPATH')) {
+                return;
+            }
+
+            $charset_collate = $wpdb->get_charset_collate();
+            $table_name = $this->gate_state_table;
+
+            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+            $sql = "CREATE TABLE {$table_name} (
+                id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+                token_hash CHAR(64) NOT NULL,
+                ip_hash CHAR(64) NOT NULL,
+                expires_at BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+                otp_pending TINYINT(1) UNSIGNED NOT NULL DEFAULT 1,
+                otp_verified_at BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY  (id),
+                UNIQUE KEY token_hash (token_hash),
+                KEY expires_at (expires_at),
+                KEY ip_hash (ip_hash)
+            ) {$charset_collate};";
+
+            dbDelta($sql);
+        }
+
+        // Gate dependencies: geo lookup.
         private function load_geoip()
         {
             if ($this->geoip_loaded && $this->geoip_reader) {
@@ -151,6 +222,7 @@ if (!class_exists('WP_Security_Hardening')) {
             }
         }
 
+        // Flow 1: Gate + IP/Country access checks for protected routes.
         public function handle_security_checks()
         {
             if ($this->is_system_request()) {
@@ -190,18 +262,6 @@ if (!class_exists('WP_Security_Hardening')) {
         private function is_protected_request($request_uri)
         {
             $path = $this->get_request_path($request_uri);
-            $is_reauth_login = (
-                strpos($path, 'wp-login.php') === 0 &&
-                (
-                    (isset($_REQUEST['reauth']) && (string) $_REQUEST['reauth'] === '1') ||
-                    (isset($_REQUEST['interim-login']) && (string) $_REQUEST['interim-login'] === '1')
-                )
-            );
-
-            // Do not block WP's built-in session reauthentication flow.
-            if ($is_reauth_login) {
-                return false;
-            }
 
             if ($path === 'admin' || $path === 'admin/') {
                 return true;
@@ -211,6 +271,8 @@ if (!class_exists('WP_Security_Hardening')) {
                 'wp-login.php',
                 'wp-register.php',
                 'wp-signup.php',
+                'wp-trackback.php',
+
             );
 
             $pagenow_blocked = isset($GLOBALS['pagenow']) && in_array(
@@ -255,11 +317,10 @@ if (!class_exists('WP_Security_Hardening')) {
                 return;
             }
 
-            // Existing valid gate token; no fresh OTP intent.
-            $this->set_fresh_gate_login_cookie(false);
             $this->redirect_to_login();
         }
 
+        // Gate helpers: request and client context.
         private function get_request_path($request_uri)
         {
             $path = trim((string) parse_url($request_uri, PHP_URL_PATH), '/');
@@ -390,17 +451,15 @@ if (!class_exists('WP_Security_Hardening')) {
             return in_array($country, $this->allowed_countries, true);
         }
 
+        // Gate token state: issue, lookup, update.
         private function set_do_access_token($mark_fresh_gate_login = false)
         {
             $token   = bin2hex(random_bytes(32));
             $ip      = $this->get_user_ip();
             $expires = time() + DAY_IN_SECONDS; // 24hrs
 
-            set_transient(
-                'do_access_' . md5($token),
-                array('ip' => $ip, 'expires' => $expires),
-                DAY_IN_SECONDS
-            );
+            $this->revoke_do_access_token();
+            $this->upsert_gate_state($token, $ip, $expires, $mark_fresh_gate_login ? 1 : 0);
 
             setcookie(
                 'do_access_token',
@@ -415,46 +474,102 @@ if (!class_exists('WP_Security_Hardening')) {
             );
 
             $_COOKIE['do_access_token'] = $token;
-            $this->set_fresh_gate_login_cookie((bool) $mark_fresh_gate_login);
 
             return $token;
         }
 
-        private function set_fresh_gate_login_cookie($enabled)
+        private function get_gate_token_hash($token)
         {
-            $cookie_name = 'do_access_fresh_login';
+            return hash('sha256', (string) $token);
+        }
 
-            if ($enabled) {
-                $expires = time() + (15 * MINUTE_IN_SECONDS);
-                setcookie(
-                    $cookie_name,
-                    '1',
-                    array(
-                        'expires'  => $expires,
-                        'path'     => '/',
-                        'secure'   => is_ssl(),
-                        'httponly' => true,
-                        'samesite' => 'Strict',
-                    )
-                );
-                $_COOKIE[$cookie_name] = '1';
+        private function get_gate_state_by_token($token = '')
+        {
+            global $wpdb;
+
+            if ($token === '') {
+                $token = isset($_COOKIE['do_access_token']) ? sanitize_text_field(wp_unslash($_COOKIE['do_access_token'])) : '';
+            }
+
+            if ($token === '') {
+                return false;
+            }
+
+            $row = $wpdb->get_row(
+                $wpdb->prepare(
+                    "SELECT token_hash, ip_hash, expires_at, otp_pending, otp_verified_at
+                     FROM {$this->gate_state_table}
+                     WHERE token_hash = %s
+                     LIMIT 1",
+                    $this->get_gate_token_hash($token)
+                ),
+                ARRAY_A
+            );
+
+            if (!is_array($row)) {
+                return false;
+            }
+
+            return array(
+                'token_hash' => (string) $row['token_hash'],
+                'ip_hash' => (string) $row['ip_hash'],
+                'expires_at' => isset($row['expires_at']) ? (int) $row['expires_at'] : 0,
+                'otp_pending' => !empty($row['otp_pending']),
+                'otp_verified_at' => isset($row['otp_verified_at']) ? (int) $row['otp_verified_at'] : 0,
+            );
+        }
+
+        private function upsert_gate_state($token, $ip, $expires_at, $otp_pending)
+        {
+            global $wpdb;
+
+            $token_hash = $this->get_gate_token_hash($token);
+            $ip_hash = hash('sha256', (string) $ip);
+            $now_mysql = current_time('mysql', 1);
+
+            $wpdb->query(
+                $wpdb->prepare(
+                    "INSERT INTO {$this->gate_state_table}
+                        (token_hash, ip_hash, expires_at, otp_pending, otp_verified_at, created_at, updated_at)
+                     VALUES (%s, %s, %d, %d, %d, %s, %s)
+                     ON DUPLICATE KEY UPDATE
+                        ip_hash = VALUES(ip_hash),
+                        expires_at = VALUES(expires_at),
+                        otp_pending = VALUES(otp_pending),
+                        updated_at = VALUES(updated_at)",
+                    $token_hash,
+                    $ip_hash,
+                    (int) $expires_at,
+                    !empty($otp_pending) ? 1 : 0,
+                    0,
+                    $now_mysql,
+                    $now_mysql
+                )
+            );
+        }
+
+        private function mark_gate_otp_verified($token)
+        {
+            global $wpdb;
+
+            if ($token === '') {
                 return;
             }
 
-            setcookie(
-                $cookie_name,
-                '',
+            $wpdb->update(
+                $this->gate_state_table,
                 array(
-                    'expires'  => time() - HOUR_IN_SECONDS,
-                    'path'     => '/',
-                    'secure'   => is_ssl(),
-                    'httponly' => true,
-                    'samesite' => 'Strict',
-                )
+                    'otp_pending' => 0,
+                    'otp_verified_at' => time(),
+                    'updated_at' => current_time('mysql', 1),
+                ),
+                array('token_hash' => $this->get_gate_token_hash($token)),
+                array('%d', '%d', '%s'),
+                array('%s')
             );
-            unset($_COOKIE[$cookie_name]);
         }
 
+        // Login URL forwarding helpers.
         private function redirect_to_login()
         {
             $login_args    = $this->get_forwarded_login_query_args();
@@ -529,6 +644,7 @@ if (!class_exists('WP_Security_Hardening')) {
             return add_query_arg($safe_args, $base_url);
         }
 
+        // Password recovery/new-user URL rewriting.
         private function rewrite_wp_login_urls_in_message($message)
         {
             if (!is_string($message) || $message === '') {
@@ -597,6 +713,7 @@ if (!class_exists('WP_Security_Hardening')) {
             return $wp_new_user_notification_email;
         }
 
+        // Session hardening: password change invalidates active state.
         public function invalidate_sessions_after_password_change($password, $user_id, $old_user_data = null)
         {
             $user_id = (int) $user_id;
@@ -634,31 +751,27 @@ if (!class_exists('WP_Security_Hardening')) {
         //     return base64_encode($time . '|' . $hash);
         // }
 
+        // Gate verification for protected surfaces.
         private function verify_do_access_token()
         {
-            $token = $_COOKIE['do_access_token'] ?? '';
-
-            if (empty($token)) {
+            $state = $this->get_gate_state_by_token();
+            if (!$state) {
                 return false;
             }
 
-            $record = get_transient('do_access_' . md5($token));
-
-            if (empty($record) || empty($record['ip']) || empty($record['expires'])) {
+            $current_ip_hash = hash('sha256', (string) $this->get_user_ip());
+            if (!hash_equals($state['ip_hash'], $current_ip_hash)) {
                 return false;
             }
 
-            if ($record['ip'] !== $this->get_user_ip()) {
-                return false;
-            }
-
-            if ($record['expires'] < time()) {
+            if ($state['expires_at'] < time()) {
                 return false;
             }
 
             return true;
         }
 
+        // Flow 2: Password attempt guard (staged lockouts).
         public function block_bruteforce_authentication($user, $username, $password)
         {
             if (!$this->is_standard_login_request()) {
@@ -693,6 +806,7 @@ if (!class_exists('WP_Security_Hardening')) {
             return $user;
         }
 
+        // Flow 3: Track failed password attempts.
         public function record_failed_login($username = '', $error = null)
         {
             if (!$this->is_standard_login_request()) {
@@ -847,6 +961,18 @@ if (!class_exists('WP_Security_Hardening')) {
                                     <?php
         }
 
+        public function hide_remember_me_option()
+        {
+            ?>
+                                    <style>
+                                        .forgetmenot {
+                                            display: none !important;
+                                        }
+                                    </style>
+                                    <?php
+        }
+
+        // Password-attempt internals.
         private function has_too_many_failed_logins()
         {
             if ($this->is_current_ip_whitelisted()) {
@@ -983,6 +1109,7 @@ if (!class_exists('WP_Security_Hardening')) {
             );
         }
 
+        // Request classifiers.
         private function is_standard_login_request()
         {
             $request_uri = $_SERVER['REQUEST_URI'] ?? '';
@@ -1018,6 +1145,7 @@ if (!class_exists('WP_Security_Hardening')) {
                 : '';
         }
 
+        // Response helpers.
         private function send_forbidden()
         {
             status_header(403);
@@ -1046,6 +1174,7 @@ if (!class_exists('WP_Security_Hardening')) {
                 array('response' => 404, 'back_link' => false)
             );
         }
+        // Flow 4: OTP challenge gate (server-side state driven).
         public function trigger_otp_challenge($user, $username, $password)
         {
             if (is_wp_error($user) || empty($user)) {
@@ -1057,15 +1186,16 @@ if (!class_exists('WP_Security_Hardening')) {
                 return $user;
             }
 
-            // WP session reauth — skip OTP, just password is enough
-            $is_reauth = isset($_REQUEST['reauth']) && $_REQUEST['reauth'] == '1';
-            if ($is_reauth) {
-                return $user;
+            $gate_state = $this->get_gate_state_by_token();
+            if (!$gate_state || !$this->verify_do_access_token()) {
+                return new WP_Error(
+                    'bagels_gate_required',
+                    esc_html__('Access denied.', 'bagels')
+                );
             }
 
-            // OTP only for fresh gate logins.
-            $is_fresh_gate_login = isset($_COOKIE['do_access_fresh_login']) && (string) $_COOKIE['do_access_fresh_login'] === '1';
-            if (!$is_fresh_gate_login) {
+            // OTP only for fresh daily gate login (server-side state).
+            if (empty($gate_state['otp_pending'])) {
                 return $user;
             }
 
@@ -1080,7 +1210,7 @@ if (!class_exists('WP_Security_Hardening')) {
 
             $token_data = array(
                 'user_id' => $user->ID,
-                'remember' => isset($_POST['rememberme']),
+                'remember' => false,
                 'time' => time(),
             );
             $token_data['hash'] = hash_hmac(
@@ -1119,6 +1249,8 @@ if (!class_exists('WP_Security_Hardening')) {
             exit;
         }
 
+        // Flow 5: OTP attempt policy.
+        // OTP internals.
         private function get_otp_max_attempts()
         {
             return max(1, (int) apply_filters('bagels_otp_max_attempts', 5));
@@ -1165,11 +1297,16 @@ if (!class_exists('WP_Security_Hardening')) {
                 }
             }
 
-            $message = empty($error_msg)
-                ? '<p class="message">' . __('Please check your email for the 6-digit verification code.', 'bagels') . '</p>'
-                : '<div id="login_error">' . esc_html($error_msg) . '</div>';
+            $message = '<p class="message">' . __('Please check your email for the 6-digit verification code.', 'bagels') . '</p>';
+            $wp_error = null;
 
-            login_header(__('Enter OTP', 'bagels'), $message);
+            if (!empty($error_msg)) {
+                $message = '';
+                $wp_error = new WP_Error();
+                $wp_error->add('bagels_otp_error', esc_html($error_msg));
+            }
+
+            login_header(__('Enter OTP', 'bagels'), $message, $wp_error);
 
             $action_url = site_url('wp-login.php?action=bagels_otp_verify', 'login_post');
             // if (isset($_REQUEST['do_access'])) {
@@ -1177,39 +1314,40 @@ if (!class_exists('WP_Security_Hardening')) {
             // }
             $login_page_url = $this->get_otp_login_url();
             ?>
-                                    <?php if ($hide_form): ?>
-                                        <p class="submit">
-                                            <a class="button button-primary button-large" href="<?php echo esc_url($login_page_url); ?>">
+            <?php if ($hide_form): ?>
+                 <p class="submit">
+                     <a class="button button-primary button-large" href="<?php echo esc_url($login_page_url); ?>">
                                                 <?php esc_html_e('Back to Login', 'bagels'); ?>
-                                            </a>
-                                        </p>
-                                    <?php else: ?>
-                                        <form name="otpform" id="otpform" action="<?php echo esc_url($action_url); ?>" method="post">
-                                            <?php wp_nonce_field('bagels_otp_verify', 'bagels_otp_nonce'); ?>
-                                            <p>
-                                                <label for="otp_code"><?php esc_html_e('Verification Code', 'bagels'); ?></label>
-                                                <input type="text" name="otp_code" id="otp_code" class="input" value="" size="20" autocomplete="off" required />
-                                            </p>
-                                            <?php if (isset($_REQUEST['redirect_to'])): ?>
-                                                        <input type="hidden" name="redirect_to" value="<?php echo esc_attr($_REQUEST['redirect_to']); ?>" />
-                                            <?php endif; ?>
-                                            <p class="submit">
-                                                <input type="submit" name="wp-submit" id="wp-submit" class="button button-primary button-large" value="<?php esc_attr_e('Verify Code', 'bagels'); ?>" />
-                                            </p>
-                                        </form>
-                                        <script type="text/javascript">
-                                            setTimeout(function() {
-                                                try {
-                                                    document.getElementById('otp_code').focus();
-                                                } catch (e) {}
-                                            }, 200);
-                                        </script>
-                                    <?php endif; ?>
-                                    <?php
-                                    login_footer();
-                                    exit;
+                    </a>
+                </p>
+            <?php else: ?>
+                <form name="otpform" id="otpform" action="<?php echo esc_url($action_url); ?>" method="post">
+                    <?php wp_nonce_field('bagels_otp_verify', 'bagels_otp_nonce'); ?>
+                    <p>
+                        <label for="otp_code"><?php esc_html_e('Verification Code', 'bagels'); ?></label>
+                        <input type="text" name="otp_code" id="otp_code" class="input" value="" size="20" autocomplete="off" required />
+                    </p>
+                    <?php if (isset($_REQUEST['redirect_to'])): ?>
+                                <input type="hidden" name="redirect_to" value="<?php echo esc_attr($_REQUEST['redirect_to']); ?>" />
+                    <?php endif; ?>
+                    <p class="submit">
+                        <input type="submit" name="wp-submit" id="wp-submit" class="button button-primary button-large" value="<?php esc_attr_e('Verify Code', 'bagels'); ?>" />
+                    </p>
+                </form>
+                <script type="text/javascript">
+                    setTimeout(function() {
+                        try {
+                            document.getElementById('otp_code').focus();
+                        } catch (e) {}
+                    }, 200);
+                </script>
+            <?php endif; ?>
+            <?php
+            login_footer();
+            exit;
         }
 
+        // Flow 6: OTP verification + session issuance.
         public function process_otp()
         {
             // if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -1232,11 +1370,11 @@ if (!class_exists('WP_Security_Hardening')) {
 
             $decoded = $this->get_otp_context_from_cookie();
             if (!$decoded) {
-                $this->render_otp_form(__('Session expired. Please log in again.', 'bagels'));
+                $this->render_otp_form(__('Session expired. Please log in again.', 'bagels'), true);
             }
 
             if (time() - $decoded['time'] > 10 * MINUTE_IN_SECONDS) {
-                $this->render_otp_form(__('Verification code expired.', 'bagels'));
+                $this->render_otp_form(__('Verification code expired.', 'bagels'), true);
             }
 
             $user_id = $decoded['user_id'];
@@ -1253,21 +1391,26 @@ if (!class_exists('WP_Security_Hardening')) {
             $entered_otp = sanitize_text_field($_POST['otp_code']);
             $stored_otp = get_transient('bagels_otp_' . $user_id);
 
+            if ($stored_otp === false) {
+                delete_transient($attempts_key);
+                setcookie('bagels_otp_token', '', time() - 3600, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
+                $this->render_otp_form(__('Verification session expired. Please log in again.', 'bagels'), true);
+            }
+
             if ($stored_otp !== false && hash_equals((string) $stored_otp, $entered_otp)) {
                 delete_transient('bagels_otp_' . $user_id);
                 delete_transient($attempts_key);
                 setcookie('bagels_otp_token', '', time() - 3600, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
                 wp_set_current_user($user_id);
-                $remember = !empty($decoded['remember']);
+                $remember = false;
 
-                $default_expiry_ts = time() + ($remember ? (14 * DAY_IN_SECONDS) : (2 * DAY_IN_SECONDS));
                 $gate_expiry_ts = 0;
                 $gate_token = isset($_COOKIE['do_access_token']) ? sanitize_text_field(wp_unslash($_COOKIE['do_access_token'])) : '';
 
                 if ($gate_token !== '') {
-                    $gate_record = get_transient('do_access_' . md5($gate_token));
-                    if (is_array($gate_record) && !empty($gate_record['expires'])) {
-                        $gate_expiry_ts = (int) $gate_record['expires'];
+                    $gate_state = $this->get_gate_state_by_token($gate_token);
+                    if (is_array($gate_state) && !empty($gate_state['expires_at'])) {
+                        $gate_expiry_ts = (int) $gate_state['expires_at'];
                     }
                 }
 
@@ -1275,8 +1418,7 @@ if (!class_exists('WP_Security_Hardening')) {
                     $gate_expiry_ts = time() + DAY_IN_SECONDS;
                 }
 
-                $min_expiry_ts = $gate_expiry_ts + (6 * HOUR_IN_SECONDS);
-                $wp_expiry_ts = max($default_expiry_ts, $min_expiry_ts);
+                $wp_expiry_ts = $gate_expiry_ts + (6 * HOUR_IN_SECONDS);
                 $cookie_expiry_filter = function($length, $uid, $rem) use ($wp_expiry_ts) {
                     return max(1, $wp_expiry_ts - time());
                 };
@@ -1284,7 +1426,7 @@ if (!class_exists('WP_Security_Hardening')) {
                 add_filter('auth_cookie_expiration', $cookie_expiry_filter, 99, 3);
                 wp_set_auth_cookie($user_id, $remember, is_ssl());
                 remove_filter('auth_cookie_expiration', $cookie_expiry_filter, 99);
-                $this->set_fresh_gate_login_cookie(false);
+                $this->mark_gate_otp_verified($gate_token);
 
                 $user = get_userdata($user_id);
                 do_action('wp_login', $user->user_login, $user);
@@ -1312,11 +1454,18 @@ if (!class_exists('WP_Security_Hardening')) {
                 )
             );
         }
+        // Gate state cleanup.
         private function revoke_do_access_token()
         {
+            global $wpdb;
+
             $token = $_COOKIE['do_access_token'] ?? '';
             if (!empty($token)) {
-                delete_transient('do_access_' . md5($token));
+                $wpdb->delete(
+                    $this->gate_state_table,
+                    array('token_hash' => $this->get_gate_token_hash($token)),
+                    array('%s')
+                );
             }
         }
 
@@ -1345,6 +1494,6 @@ if (!class_exists('WP_Security_Hardening')) {
     }
     return $available;
 }, 10, 2);
-
+add_filter('xmlrpc_enabled', '__return_false');
     new WP_Security_Hardening();
 }
