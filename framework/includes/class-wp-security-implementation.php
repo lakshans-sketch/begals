@@ -11,14 +11,6 @@
  * @version    1.0.1
  */
 
-if (
-    isset($_SERVER['REQUEST_URI']) &&
-    strpos($_SERVER['REQUEST_URI'], 'xmlrpc.php') !== false
-) {
-    http_response_code(403);
-    header('Content-Type: text/plain');
-    exit('Access denied.');
-}
 if (!class_exists('WP_Security_Hardening')) {
 
     class WP_Security_Hardening
@@ -75,6 +67,7 @@ if (!class_exists('WP_Security_Hardening')) {
             add_action('wp_login_failed', array($this, 'record_failed_login'), 10, 2);
             add_action('wp_login', array($this, 'clear_failed_login_attempts'));
             add_filter('login_message', array($this, 'render_login_attempt_notice'));
+            add_filter('login_errors', array($this, 'filter_lockout_login_errors'));
             add_action('login_head', array($this, 'hide_login_form_during_lockout'));
             add_action('login_head', array($this, 'hide_remember_me_option'));
             add_action('wp_set_password', array($this, 'invalidate_sessions_after_password_change'), 10, 3);
@@ -686,18 +679,31 @@ if (!class_exists('WP_Security_Hardening')) {
 
         public function filter_retrieve_password_notification_email($defaults, $key, $user_login, $user_data)
         {
-            if (!is_array($defaults) || empty($defaults['message']) || !is_string($defaults['message'])) {
+            if (!is_array($defaults)) {
                 return $defaults;
             }
 
-            $defaults['message'] = $this->rewrite_wp_login_urls_in_message($defaults['message']);
+            $site_title = get_bloginfo('name');
+            $site_domain = (string) wp_parse_url(home_url(), PHP_URL_HOST);
+            $site_domain = preg_replace('/^www\./i', '', $site_domain);
+            $from_email = sanitize_email('no-reply@' . $site_domain);
+
+            if (!empty($site_title)) {
+                $defaults['subject'] = sprintf('[%s] Password Reset Request', $site_title);
+            }
+
+            $defaults['message'] = $this->build_reset_password_email_message($key, $user_login);
+            $defaults['headers'] = array(
+                'Content-Type: text/plain; charset=UTF-8',
+                sprintf('From: %s <%s>', $site_title, $from_email),
+            );
 
             return $defaults;
         }
 
         public function filter_retrieve_password_message($message, $key, $user_login, $user_data)
         {
-            return $this->rewrite_wp_login_urls_in_message((string) $message);
+            return $this->build_reset_password_email_message($key, $user_login);
         }
 
         public function filter_new_user_notification_email($wp_new_user_notification_email, $user, $blogname)
@@ -711,6 +717,32 @@ if (!class_exists('WP_Security_Hardening')) {
             );
 
             return $wp_new_user_notification_email;
+        }
+
+        private function build_reset_password_email_message($key, $user_login)
+        {
+            $site_title = get_bloginfo('name');
+            $user_login = sanitize_user((string) $user_login, true);
+            $key = sanitize_text_field((string) $key);
+            $reset_url = $this->build_protected_login_url(
+                array(
+                    'action' => 'rp',
+                    'key' => $key,
+                    'login' => $user_login,
+                )
+            );
+
+            return implode(
+                "\n\n",
+                array(
+                    sprintf('A request was made to reset the password for your %s website admin panel account.', $site_title),
+                    sprintf('Username: %s', $user_login),
+                    'To reset your password, click the link below:',
+                    $reset_url,
+                    "If you didn't request a password reset, you can safely ignore this email.",
+                    "This is an automatically generated email. Replies to this email address aren't monitored.",
+                )
+            );
         }
 
         // Session hardening: password change invalidates active state.
@@ -895,19 +927,11 @@ if (!class_exists('WP_Security_Hardening')) {
             $notice = '';
 
             if (!empty($state['permanent_block'])) {
-                $notice = esc_html__('This IP address is permanently blocked. Please contact the site administrator.', 'bagels');
-                return $message . '<div id="login_error">' . esc_html($notice) . '</div>';
+                return $message;
             }
 
             if ((int) $state['lock_until'] > $now) {
-                $remaining = (int) $state['lock_until'] - $now;
-                $notice = sprintf(
-                    /* translators: %s: Human readable duration */
-                    esc_html__('Too many failed login attempts. Try again in %s.', 'bagels'),
-                    esc_html(human_time_diff($now, $now + max(1, $remaining)))
-                );
-
-                return $message . '<div id="login_error">' . esc_html($notice) . '</div>';
+                return $message;
             }
 
             if ((int) $state['total_failures'] > 0) {
@@ -920,7 +944,7 @@ if (!class_exists('WP_Security_Hardening')) {
                 if ($attempts_left > 0) {
                     $notice = sprintf(
                         /* translators: %d: Remaining attempts */
-                        esc_html__('Login attempts left before lock: %d', 'bagels'),
+                        esc_html__('You have %d more login attempts left.', 'bagels'),
                         (int) $attempts_left
                     );
 
@@ -929,6 +953,44 @@ if (!class_exists('WP_Security_Hardening')) {
             }
 
             return $message;
+        }
+
+        public function filter_lockout_login_errors($errors)
+        {
+            if (!$this->is_standard_login_request()) {
+                return $errors;
+            }
+
+            if ($this->is_current_ip_whitelisted()) {
+                return $errors;
+            }
+
+            $current_action = isset($_REQUEST['action']) ? sanitize_key(wp_unslash($_REQUEST['action'])) : '';
+            if (in_array($current_action, array('bagels_otp', 'bagels_otp_verify'), true)) {
+                return $errors;
+            }
+
+            if (!$this->has_too_many_failed_logins()) {
+                return $errors;
+            }
+
+            $state = $this->get_failed_login_state();
+            $now = time();
+
+            if (!empty($state['permanent_block'])) {
+                return esc_html__('This IP address is permanently blocked. Please contact the site administrator.', 'bagels');
+            }
+
+            if ((int) $state['lock_until'] > $now) {
+                $remaining = (int) $state['lock_until'] - $now;
+                return sprintf(
+                    /* translators: %s: Human readable duration */
+                    esc_html__('Too many failed login attempts. Try again in %s.', 'bagels'),
+                    esc_html(human_time_diff($now, $now + max(1, $remaining)))
+                );
+            }
+
+            return $errors;
         }
 
         public function hide_login_form_during_lockout()
@@ -967,6 +1029,11 @@ if (!class_exists('WP_Security_Hardening')) {
                                     <style>
                                         .forgetmenot {
                                             display: none !important;
+                                        }
+                                        .login .message,
+                                        .login .notice,
+                                        .login .success {
+                                            margin-top: 20px !important;
                                         }
                                     </style>
                                     <?php
@@ -1169,7 +1236,7 @@ if (!class_exists('WP_Security_Hardening')) {
             // }
             // Fallback if no 404 template found
             wp_die(
-                esc_html__('Page not found.Contact Your Administration', 'bagels'),
+                esc_html__('Page not found. Please contact your administrator for further details.', 'bagels'),
                 esc_html__('404', 'bagels'),
                 array('response' => 404, 'back_link' => false)
             );
@@ -1204,9 +1271,29 @@ if (!class_exists('WP_Security_Hardening')) {
             delete_transient($this->get_otp_attempts_key($user->ID));
 
             $to = $user->user_email;
-            $subject = get_bloginfo('name') . ' - Login Verification Code';
-            $message = "Your verification code is: {$otp}\n\nThis code will expire in 10 minutes.";
-            wp_mail($to, $subject, $message);
+            $site_title = get_bloginfo('name');
+            $site_domain = (string) wp_parse_url(home_url(), PHP_URL_HOST);
+            $site_domain = preg_replace('/^www\./i', '', $site_domain);
+            $from_email = sanitize_email('no-reply@' . $site_domain);
+            $subject = $site_title . ' - Login Verification Code';
+            $message = implode(
+                "\n\n",
+                array(
+                    'Here is your login verification code:',
+                    (string) $otp,
+                    'This code is valid for 10 minutes.',
+                    sprintf(
+                        "You're receiving this email because a login verification code was requested for your %s website admin panel account. If this wasn't you, please ignore this email.",
+                        $site_title
+                    ),
+                    "This is an automatically generated email. Replies to this email address aren't monitored.",
+                )
+            );
+            $headers = array(
+                'Content-Type: text/plain; charset=UTF-8',
+                sprintf('From: %s <%s>', $site_title, $from_email),
+            );
+            wp_mail($to, $subject, $message, $headers);
 
             $token_data = array(
                 'user_id' => $user->ID,
@@ -1324,7 +1411,7 @@ if (!class_exists('WP_Security_Hardening')) {
                 <form name="otpform" id="otpform" action="<?php echo esc_url($action_url); ?>" method="post">
                     <?php wp_nonce_field('bagels_otp_verify', 'bagels_otp_nonce'); ?>
                     <p>
-                        <label for="otp_code"><?php esc_html_e('Verification Code', 'bagels'); ?></label>
+                        <label for="otp_code"><?php esc_html_e('Login Verification Code', 'bagels'); ?></label>
                         <input type="text" name="otp_code" id="otp_code" class="input" value="" size="20" autocomplete="off" required />
                     </p>
                     <?php if (isset($_REQUEST['redirect_to'])): ?>
@@ -1494,6 +1581,6 @@ if (!class_exists('WP_Security_Hardening')) {
     }
     return $available;
 }, 10, 2);
-add_filter('xmlrpc_enabled', '__return_false');
+// add_filter('xmlrpc_enabled', '__return_false');
     new WP_Security_Hardening();
 }
