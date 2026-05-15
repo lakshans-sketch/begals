@@ -1580,7 +1580,17 @@ if (!class_exists('WP_Security_Hardening')) {
         return false;
     }
     return $available;
-}, 10, 2);
-// add_filter('xmlrpc_enabled', '__return_false');
+	}, 10, 2);
+	add_filter('xmlrpc_enabled', '__return_false');
+	
+	// Also remove the header link advertising it
+	add_filter( 'wp_headers', function( $headers ) {
+	    unset( $headers['X-Pingback'] );
+	    return $headers;
+	});
+	
+	// Remove the link tag in <head>
+	remove_action( 'wp_head', 'rsd_link' );
+	
     new WP_Security_Hardening();
 }
